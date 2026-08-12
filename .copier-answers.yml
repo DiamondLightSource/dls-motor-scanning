@@ -1,0 +1,19 @@
+# Changes here will be overwritten by Copier
+_commit: 5.3.0
+_src_path: https://github.com/DiamondLightSource/python-copier-template.git
+author_email: lee.hudson@diamond.ac.uk
+author_name: Lee Hudson
+component_lifecycle: production
+component_owner: ''
+component_type: application
+description: A tool to facilitate automatic scanning of an EPICS motor
+distribution_name: dls-motor-scanning
+docker: true
+docs_type: README
+git_platform: github.com
+github_org: DiamondLightSource
+package_name: dls_motor_scanning
+pypi: true
+repo_name: dls-motor-scanning
+strict_typing: true
+type_checker: pyright
