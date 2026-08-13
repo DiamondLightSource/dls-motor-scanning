@@ -1,0 +1,336 @@
+# Library version specification required for dls libraris
+import datetime
+import sys
+import time
+from math import pow, sqrt
+
+import matplotlib.pyplot as plot
+from cothread.catools import caget, caput
+
+TIMEOUT = 100
+PV_VAL = ".VAL"
+PV_RBV = ".RBV"
+PV_EGU = ".EGU"
+PV_UEIP = ".UEIP"
+PV_VELO = ".VELO"
+PV_ACCL = ".ACCL"
+
+
+def main():
+    print("Motor step scanning...")
+
+    if len(sys.argv) < 6:
+        print("Error. Wrong number of arguments.")
+        print(
+            f"  Usage: {str(__file__)} motor_pv start stop step delay extraPV(optional)"
+        )
+        sys.exit(1)
+
+    motor = sys.argv[1]
+    start = float(sys.argv[2])
+    stop = float(sys.argv[3])
+    step = float(sys.argv[4])
+    delay = float(sys.argv[5])
+
+    extra_pv = None
+    if len(sys.argv) == 7:
+        extra_pv = sys.argv[6]
+
+    points = (abs(stop - start)) / step
+    print(
+        "Moving "
+        + motor
+        + " from "
+        + str(start)
+        + " to "
+        + str(stop)
+        + " in steps of "
+        + str(step)
+    )
+    print("Number of points in the scan: " + str(int(points)))
+
+    # Get the date
+    now = datetime.datetime.now()
+    thedate = now.strftime("%Y-%m-%d-%H:%M:%S")
+
+    # Make base file name
+    filename = (
+        "Scan_"
+        + motor
+        + "_"
+        + thedate
+        + "_"
+        + str(start)
+        + "_"
+        + str(stop)
+        + "_"
+        + str(abs(step))
+    )
+
+    # Open txt file for writing
+    file = open(filename + ".txt", "w")
+
+    # Read UEIP, VELO, ACCL and EGU
+    ueip = str(caget(motor + PV_UEIP))
+    velo = str(caget(motor + PV_VELO))
+    accl = str(caget(motor + PV_ACCL))
+    egu = str(caget(motor + PV_EGU))
+
+    if stop < start:
+        step = step * -1.0
+
+    mean_time = 0
+    max_time = 0
+    min_time = 0
+    mean_pos_error = 0
+    max_pos_error = 0
+    min_pos_error = 0
+
+    pos_error_array = []
+    extra_pv_array = []
+    pos_array = []
+    time_array = []
+
+    print("Moving to start position of " + str(start))
+    caput(motor + PV_VAL, start, wait=True, timeout=TIMEOUT)
+
+    if extra_pv is None:
+        print("Desired Actual MoveTime")
+        file.write("Desired Actual MoveTime\n")
+    else:
+        print(f"Desired Actual MoveTime {extra_pv}")
+        file.write(f"Desired Actual MoveTime {extra_pv}\n")
+
+    for i in range(int(points)):
+        position = start + ((i + 1) * step)
+
+        # Move a step
+        start_time = time.time()
+        caput(motor + PV_VAL, position, wait=True, timeout=TIMEOUT)
+        end_time = time.time()
+
+        # Wait for motor to settle
+        if delay > 0:
+            time.sleep(delay)
+        value = caget(motor + PV_RBV)
+        pos_array.append(value)
+
+        if extra_pv is not None:
+            extra_pv_val = caget(extra_pv)
+            extra_pv_array.append(extra_pv_val)
+
+        # Calculate position error
+        pos_error = position - value
+        if i == 0:
+            min_pos_error = pos_error
+        if pos_error > max_pos_error:
+            max_pos_error = pos_error
+        if pos_error < min_pos_error:
+            min_pos_error = pos_error
+        mean_pos_error = mean_pos_error + abs(pos_error)  # use absolute value for mean
+        pos_error_array.append(pos_error)
+
+        # Calculate time taken for move
+        diff_time = end_time - start_time
+        if i == 0:
+            min_time = diff_time
+        if diff_time > max_time:
+            max_time = diff_time
+        if diff_time < min_time:
+            min_time = diff_time
+        mean_time = mean_time + diff_time
+        time_array.append(diff_time)
+
+        if extra_pv is not None:
+            print(
+                str(position)
+                + " "
+                + str(value)
+                + " "
+                + str(diff_time)
+                + " "
+                + str(extra_pv_val)
+            )
+            file.write(
+                str(position)
+                + " "
+                + str(value)
+                + " "
+                + str(diff_time)
+                + " "
+                + str(extra_pv_val)
+                + "\n"
+            )
+        else:
+            print(str(position) + " " + str(value) + " " + str(diff_time))
+            file.write(str(position) + " " + str(value) + " " + str(diff_time) + "\n")
+
+    file.flush()
+    file.close()
+
+    # Calculate means
+    mean_pos_error = mean_pos_error / points
+    mean_time = mean_time / points
+    # Calculate standard deviation
+    sd_pos = 0
+    sd_time = 0
+    for i in range(int(points)):
+        sd_pos = sd_pos + pow((abs(pos_error_array[i]) - mean_pos_error), 2)
+        sd_time = sd_time + pow((time_array[i] - mean_time), 2)
+    sd_pos = sqrt(sd_pos / points)
+    sd_time = sqrt(sd_time / points)
+    # Calculate error on mean
+    pos_mean_error = sd_pos / sqrt(points)
+    time_mean_error = sd_time / sqrt(points)
+
+    print("\n**********************************************")
+    print(
+        "  Moving "
+        + motor
+        + " from "
+        + str(start)
+        + " to "
+        + str(stop)
+        + " in steps of "
+        + str(step)
+    )
+    print("  Date: " + thedate)
+    print("  Number of points in the scan: " + str(points))
+    print("  UEIP:" + ueip + " VELO:" + velo + " ACCL:" + accl)
+    print("**********************************************")
+    print("Time taken for moves:")
+    print("  Mean: " + str(mean_time) + " +/- " + str(time_mean_error) + " secs")
+    print("  Standard Deviation: " + str(sd_time))
+    print("  Min: " + str(min_time) + " secs")
+    print("  Max: " + str(max_time) + " secs")
+    print("**********************************************")
+    print(
+        "Position error magnitude at the end of each move "
+        "(taking into account settling time delay)"
+    )
+    print("  Mean: " + str(mean_pos_error) + " +/- " + str(pos_mean_error))
+    print("  Standard Deviation: " + str(sd_pos))
+    print("  Min Pos Error: " + str(min_pos_error))
+    print("  Max Pos Error: " + str(max_pos_error))
+    print("  Delay: " + str(delay) + " secs\n")
+
+    # Plot data
+    # Plot data for position
+
+    plot_size = 200
+    if extra_pv is not None:
+        plot_size += 100
+
+    fig = plot.figure(1, figsize=(8.27, 11.69))
+    fig.suptitle(
+        "Step Scanning "
+        + str(motor)
+        + "\nStart="
+        + str(start)
+        + " Stop="
+        + str(stop)
+        + " Step="
+        + str(abs(step))
+        + " Delay="
+        + str(delay)
+        + "\n"
+        + thedate
+        + "\n UEIP:"
+        + ueip
+        + " VELO:"
+        + velo
+        + " ACCL:"
+        + accl,
+        fontsize=14,
+    )
+    plot.subplot(plot_size + 11)
+    plot.plot(pos_error_array)
+    text_pos_offset = 0
+    if abs(min_pos_error) > abs(max_pos_error):
+        if min_pos_error < 0:
+            plot.ylim(
+                min_pos_error + (min_pos_error / 10),
+                -min_pos_error - (min_pos_error / 10),
+            )
+        else:
+            plot.ylim(
+                -min_pos_error - (min_pos_error / 10),
+                min_pos_error + (min_pos_error / 10),
+            )
+        text_pos_offset = abs(min_pos_error) - abs(min_pos_error) / 10
+    else:
+        if max_pos_error < 0:
+            plot.ylim(
+                max_pos_error + (max_pos_error / 10),
+                -max_pos_error - (max_pos_error / 10),
+            )
+        else:
+            plot.ylim(
+                -max_pos_error - (max_pos_error / 10),
+                max_pos_error + (max_pos_error / 10),
+            )
+        text_pos_offset = abs(max_pos_error) - abs(max_pos_error) / 10
+    plot.ylabel("Demand Position - Actual Position (" + egu + ")")
+    plot.xlabel("Step")
+    plot_text = (
+        "Mean="
+        + str(mean_pos_error)
+        + "+/-"
+        + str(pos_mean_error)
+        + "\n"
+        + "SD="
+        + str(sd_pos)
+    )
+    plot.text(
+        points / 5,
+        text_pos_offset,
+        plot_text,
+        horizontalalignment="left",
+        verticalalignment="top",
+    )
+    plot.axhline(y=0, xmin=0, xmax=points, linestyle="--", color="black")
+    # Plot data for time
+    plot.subplot(plot_size + 12)
+    plot.ylabel("Time Taken For Move (Seconds)")
+    plot.xlabel("Step")
+    plot_text = (
+        "Mean="
+        + str(mean_time)
+        + "+/-"
+        + str(time_mean_error)
+        + "\n"
+        + "SD="
+        + str(sd_time)
+    )
+    plot.text(
+        points / 5,
+        0 + (max_time / 6),
+        plot_text,
+        horizontalalignment="left",
+        verticalalignment="top",
+    )
+    plot.plot(time_array, color="r")
+    plot.ylim(0, max_time + (max_time / 10))
+
+    if extra_pv is not None:
+        plot.subplot(313)
+        plot.ylabel(extra_pv)
+        plot.plot(pos_array, extra_pv_array, color="b")
+        plot.ylim(min(extra_pv_array), max(extra_pv_array))
+        plot.xlim(min(pos_array), max(pos_array))
+        plot.xlabel("Actual Position (mm)")
+
+    plot.savefig(filename + ".png")
+    plot.show()
+
+    print("  Plot saved in " + str(filename) + ".png")
+    print("  Data saved in " + str(filename) + ".txt\n")
+
+
+if __name__ == "__main__":
+    from pkg_resources import require
+
+    require("numpy")
+    require("cothread")
+    require("matplotlib")
+    main()
