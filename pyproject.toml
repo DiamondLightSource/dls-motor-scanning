@@ -32,7 +32,7 @@ dev = [
 ]
 
 [project.scripts]
-dls-motor-scanning = "dls_motor_scanning.__main__:main"
+dls-motor-scanning = "dls_motor_scanning.dls_motor_scanning:main"
 
 [project.urls]
 GitHub = "https://github.com/DiamondLightSource/dls-motor-scanning"
