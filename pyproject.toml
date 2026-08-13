@@ -13,7 +13,7 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 description = "A tool to facilitate automatic scanning of an EPICS motor"
-dependencies = [] # Add project dependencies here, e.g. ["click", "numpy"]
+dependencies = ["numpy","cothread","matplotlib", "pandas", "argparse"] # Add project dependencies here, e.g. ["click", "numpy"]
 dynamic = ["version"]
 license.file = "LICENSE"
 readme = "README.md"

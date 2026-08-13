@@ -58,8 +58,8 @@ def main():
         )
 
     # Extract columns
-    raw_feedback = df[int_column].values
-    encoder = df[float_column].values
+    raw_feedback = df[int_column].to_numpy()
+    encoder = df[float_column].to_numpy()
 
     # Fit a 5th-degree polynomial: encoder = f(raw_feedback)
     coefficients = np.polyfit(raw_feedback, encoder, 5)
