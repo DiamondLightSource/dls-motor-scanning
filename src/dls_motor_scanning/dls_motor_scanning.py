@@ -1,6 +1,6 @@
 # Library version specification required for dls libraris
+import argparse
 import datetime
-import sys
 import time
 from math import pow, sqrt
 
@@ -17,24 +17,43 @@ PV_ACCL = ".ACCL"
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Step scan a motor and measure its positioning performance.\n"
+        "The motor is moved from start to stop in fixed steps, and at each\n"
+        "step the readback position and the time taken for the move are\n"
+        "recorded.\n\n"
+        "The tool produces:\n"
+        "A txt file of the raw scan data\n"
+        "A png plot of position error and move time against step\n"
+        "Summary statistics printed to the terminal",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+
+    parser.add_argument("motor", type=str, help="Motor record PV to scan")
+    parser.add_argument("start", type=float, help="Start position in motor EGUs")
+    parser.add_argument("stop", type=float, help="Stop position in motor EGUs")
+    parser.add_argument("step", type=float, help="Step size in motor EGUs")
+    parser.add_argument(
+        "delay", type=float, help="Settling time in seconds to wait after each move"
+    )
+    parser.add_argument(
+        "extra_pv",
+        type=str,
+        nargs="?",
+        default=None,
+        help="Additional PV to read at each step and plot against position",
+    )
+
+    args = parser.parse_args()
+
+    motor = args.motor
+    start = args.start
+    stop = args.stop
+    step = args.step
+    delay = args.delay
+    extra_pv = args.extra_pv
+
     print("Motor step scanning...")
-
-    if len(sys.argv) < 6:
-        print("Error. Wrong number of arguments.")
-        print(
-            f"  Usage: {str(__file__)} motor_pv start stop step delay extraPV(optional)"
-        )
-        sys.exit(1)
-
-    motor = sys.argv[1]
-    start = float(sys.argv[2])
-    stop = float(sys.argv[3])
-    step = float(sys.argv[4])
-    delay = float(sys.argv[5])
-
-    extra_pv = None
-    if len(sys.argv) == 7:
-        extra_pv = sys.argv[6]
 
     points = (abs(stop - start)) / step
     print(
