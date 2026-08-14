@@ -5,7 +5,7 @@ import time
 from math import pow, sqrt
 
 import matplotlib.pyplot as plot
-from cothread.catools import caget, caput
+from cothread.catools import FORMAT_TIME, caget, caput
 
 TIMEOUT = 100
 PV_VAL = ".VAL"
@@ -68,6 +68,30 @@ def main():
         help="Post trigger delay (default: 0.0)",
     )
 
+    parser.add_argument(
+        "--timestamp",
+        action="store_true",
+        help="Add a UTC Timestamp column from the EPICS timestamp of the RBV read",
+    )
+
+    parser.add_argument(
+        "--no-txt",
+        action="store_true",
+        help="Do not write the txt file of raw scan data",
+    )
+
+    parser.add_argument(
+        "--no-png",
+        action="store_true",
+        help="Do not save the plot as a png file",
+    )
+
+    parser.add_argument(
+        "--no-plot",
+        action="store_true",
+        help="Do not display the plot on screen",
+    )
+
     args = parser.parse_args()
 
     motor = args.motor
@@ -79,6 +103,10 @@ def main():
     trigger_pv = args.trigger_pv
     trigger_width = args.trigger_width
     trigger_post_delay = args.trigger_post_delay
+    timestamp = args.timestamp
+    no_txt = args.no_txt
+    no_png = args.no_png
+    no_plot = args.no_plot
 
     print("Motor step scanning...")
 
@@ -113,8 +141,12 @@ def main():
         + str(abs(step))
     )
 
-    # Open txt file for writing
-    file = open(filename + ".txt", "w")
+    # Open txt file for writing, unless the export has been suppressed
+    file = None if no_txt else open(filename + ".txt", "w")
+
+    def write(text):
+        if file is not None:
+            file.write(text)
 
     # Read UEIP, VELO, ACCL and EGU
     ueip = str(caget(motor + PV_UEIP))
@@ -140,12 +172,14 @@ def main():
     print("Moving to start position of " + str(start))
     caput(motor + PV_VAL, start, wait=True, timeout=TIMEOUT)
 
-    if extra_pv is None:
-        print("Desired Actual MoveTime")
-        file.write("Desired Actual MoveTime\n")
-    else:
-        print(f"Desired Actual MoveTime {extra_pv}")
-        file.write(f"Desired Actual MoveTime {extra_pv}\n")
+    headings = ["Desired", "Actual", "MoveTime"]
+    if extra_pv is not None:
+        headings.append(extra_pv)
+    if timestamp:
+        headings.append("Timestamp(UTC)")
+    heading = " ".join(headings)
+    print(heading)
+    write(heading + "\n")
 
     for i in range(int(points)):
         position = start + ((i + 1) * step)
@@ -158,7 +192,14 @@ def main():
         # Wait for motor to settle
         if delay > 0:
             time.sleep(delay)
-        value = caget(motor + PV_RBV)
+        if timestamp:
+            # FORMAT_TIME augments the value with the record's EPICS timestamp
+            value = caget(motor + PV_RBV, format=FORMAT_TIME)
+            value_timestamp = datetime.datetime.fromtimestamp(
+                value.timestamp, tz=datetime.UTC
+            ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        else:
+            value = caget(motor + PV_RBV)
         pos_array.append(value)
 
         if extra_pv is not None:
@@ -193,32 +234,18 @@ def main():
             caput(trigger_pv, 0, wait=True, timeout=TIMEOUT)
             time.sleep(trigger_post_delay)
 
+        fields = [str(position), str(value), str(diff_time)]
         if extra_pv is not None:
-            print(
-                str(position)
-                + " "
-                + str(value)
-                + " "
-                + str(diff_time)
-                + " "
-                + str(extra_pv_val)
-            )
-            file.write(
-                str(position)
-                + " "
-                + str(value)
-                + " "
-                + str(diff_time)
-                + " "
-                + str(extra_pv_val)
-                + "\n"
-            )
-        else:
-            print(str(position) + " " + str(value) + " " + str(diff_time))
-            file.write(str(position) + " " + str(value) + " " + str(diff_time) + "\n")
+            fields.append(str(extra_pv_val))
+        if timestamp:
+            fields.append(str(value_timestamp))
+        row = " ".join(fields)
+        print(row)
+        write(row + "\n")
 
-    file.flush()
-    file.close()
+    if file is not None:
+        file.flush()
+        file.close()
 
     # Calculate means
     mean_pos_error = mean_pos_error / points
@@ -269,114 +296,119 @@ def main():
     # Plot data
     # Plot data for position
 
-    plot_size = 200
-    if extra_pv is not None:
-        plot_size += 100
+    if not (no_png and no_plot):
+        plot_size = 200
+        if extra_pv is not None:
+            plot_size += 100
 
-    fig = plot.figure(1, figsize=(8.27, 11.69))
-    fig.suptitle(
-        "Step Scanning "
-        + str(motor)
-        + "\nStart="
-        + str(start)
-        + " Stop="
-        + str(stop)
-        + " Step="
-        + str(abs(step))
-        + " Delay="
-        + str(delay)
-        + "\n"
-        + thedate
-        + "\n UEIP:"
-        + ueip
-        + " VELO:"
-        + velo
-        + " ACCL:"
-        + accl,
-        fontsize=14,
-    )
-    plot.subplot(plot_size + 11)
-    plot.plot(pos_error_array)
-    text_pos_offset = 0
-    if abs(min_pos_error) > abs(max_pos_error):
-        if min_pos_error < 0:
-            plot.ylim(
-                min_pos_error + (min_pos_error / 10),
-                -min_pos_error - (min_pos_error / 10),
-            )
+        fig = plot.figure(1, figsize=(8.27, 11.69))
+        fig.suptitle(
+            "Step Scanning "
+            + str(motor)
+            + "\nStart="
+            + str(start)
+            + " Stop="
+            + str(stop)
+            + " Step="
+            + str(abs(step))
+            + " Delay="
+            + str(delay)
+            + "\n"
+            + thedate
+            + "\n UEIP:"
+            + ueip
+            + " VELO:"
+            + velo
+            + " ACCL:"
+            + accl,
+            fontsize=14,
+        )
+        plot.subplot(plot_size + 11)
+        plot.plot(pos_error_array)
+        text_pos_offset = 0
+        if abs(min_pos_error) > abs(max_pos_error):
+            if min_pos_error < 0:
+                plot.ylim(
+                    min_pos_error + (min_pos_error / 10),
+                    -min_pos_error - (min_pos_error / 10),
+                )
+            else:
+                plot.ylim(
+                    -min_pos_error - (min_pos_error / 10),
+                    min_pos_error + (min_pos_error / 10),
+                )
+            text_pos_offset = abs(min_pos_error) - abs(min_pos_error) / 10
         else:
-            plot.ylim(
-                -min_pos_error - (min_pos_error / 10),
-                min_pos_error + (min_pos_error / 10),
-            )
-        text_pos_offset = abs(min_pos_error) - abs(min_pos_error) / 10
-    else:
-        if max_pos_error < 0:
-            plot.ylim(
-                max_pos_error + (max_pos_error / 10),
-                -max_pos_error - (max_pos_error / 10),
-            )
-        else:
-            plot.ylim(
-                -max_pos_error - (max_pos_error / 10),
-                max_pos_error + (max_pos_error / 10),
-            )
-        text_pos_offset = abs(max_pos_error) - abs(max_pos_error) / 10
-    plot.ylabel("Demand Position - Actual Position (" + egu + ")")
-    plot.xlabel("Step")
-    plot_text = (
-        "Mean="
-        + str(mean_pos_error)
-        + "+/-"
-        + str(pos_mean_error)
-        + "\n"
-        + "SD="
-        + str(sd_pos)
-    )
-    plot.text(
-        points / 5,
-        text_pos_offset,
-        plot_text,
-        horizontalalignment="left",
-        verticalalignment="top",
-    )
-    plot.axhline(y=0, xmin=0, xmax=points, linestyle="--", color="black")
-    # Plot data for time
-    plot.subplot(plot_size + 12)
-    plot.ylabel("Time Taken For Move (Seconds)")
-    plot.xlabel("Step")
-    plot_text = (
-        "Mean="
-        + str(mean_time)
-        + "+/-"
-        + str(time_mean_error)
-        + "\n"
-        + "SD="
-        + str(sd_time)
-    )
-    plot.text(
-        points / 5,
-        0 + (max_time / 6),
-        plot_text,
-        horizontalalignment="left",
-        verticalalignment="top",
-    )
-    plot.plot(time_array, color="r")
-    plot.ylim(0, max_time + (max_time / 10))
+            if max_pos_error < 0:
+                plot.ylim(
+                    max_pos_error + (max_pos_error / 10),
+                    -max_pos_error - (max_pos_error / 10),
+                )
+            else:
+                plot.ylim(
+                    -max_pos_error - (max_pos_error / 10),
+                    max_pos_error + (max_pos_error / 10),
+                )
+            text_pos_offset = abs(max_pos_error) - abs(max_pos_error) / 10
+        plot.ylabel("Demand Position - Actual Position (" + egu + ")")
+        plot.xlabel("Step")
+        plot_text = (
+            "Mean="
+            + str(mean_pos_error)
+            + "+/-"
+            + str(pos_mean_error)
+            + "\n"
+            + "SD="
+            + str(sd_pos)
+        )
+        plot.text(
+            points / 5,
+            text_pos_offset,
+            plot_text,
+            horizontalalignment="left",
+            verticalalignment="top",
+        )
+        plot.axhline(y=0, xmin=0, xmax=points, linestyle="--", color="black")
+        # Plot data for time
+        plot.subplot(plot_size + 12)
+        plot.ylabel("Time Taken For Move (Seconds)")
+        plot.xlabel("Step")
+        plot_text = (
+            "Mean="
+            + str(mean_time)
+            + "+/-"
+            + str(time_mean_error)
+            + "\n"
+            + "SD="
+            + str(sd_time)
+        )
+        plot.text(
+            points / 5,
+            0 + (max_time / 6),
+            plot_text,
+            horizontalalignment="left",
+            verticalalignment="top",
+        )
+        plot.plot(time_array, color="r")
+        plot.ylim(0, max_time + (max_time / 10))
 
-    if extra_pv is not None:
-        plot.subplot(313)
-        plot.ylabel(extra_pv)
-        plot.plot(pos_array, extra_pv_array, color="b")
-        plot.ylim(min(extra_pv_array), max(extra_pv_array))
-        plot.xlim(min(pos_array), max(pos_array))
-        plot.xlabel("Actual Position (mm)")
+        if extra_pv is not None:
+            plot.subplot(313)
+            plot.ylabel(extra_pv)
+            plot.plot(pos_array, extra_pv_array, color="b")
+            plot.ylim(min(extra_pv_array), max(extra_pv_array))
+            plot.xlim(min(pos_array), max(pos_array))
+            plot.xlabel("Actual Position (mm)")
 
-    plot.savefig(filename + ".png")
-    plot.show()
+        if not no_png:
+            plot.savefig(filename + ".png")
+            print("  Plot saved in " + str(filename) + ".png")
 
-    print("  Plot saved in " + str(filename) + ".png")
-    print("  Data saved in " + str(filename) + ".txt\n")
+    if not no_txt:
+        print("  Data saved in " + str(filename) + ".txt\n")
+
+    if not no_plot:
+        plot.show()
 
 
 if __name__ == "__main__":
