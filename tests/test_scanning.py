@@ -11,6 +11,7 @@ from dls_motor_scanning.scanning import (
     ScanConfig,
     ScanPoint,
     headings,
+    interactive_backend,
     perform_scan,
     plan_scan,
     row,
@@ -154,6 +155,39 @@ def test_perform_scan_saves_a_png(
 ):
     monkeypatch.chdir(tmp_path)
     perform_scan(config(save_png=True))
+
+    written = list(tmp_path.glob("Scan_*.png"))
+    assert len(written) == 1
+    assert written[0].stat().st_size > 0
+
+
+def test_interactive_backend_is_none_without_a_display(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    assert interactive_backend() is None
+
+
+def test_interactive_backend_is_none_without_a_qt_binding(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A display alone is not enough; PyQt has to import as well."""
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setitem(sys.modules, "PyQt5.QtWidgets", None)
+    monkeypatch.setitem(sys.modules, "PyQt6.QtWidgets", None)
+    assert interactive_backend() is None
+
+
+def test_png_is_written_even_when_the_plot_cannot_be_shown(
+    fake_ca: FakeCatools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The png must not depend on a working GUI toolkit."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+
+    perform_scan(config(save_png=True, show_plot=True))
 
     written = list(tmp_path.glob("Scan_*.png"))
     assert len(written) == 1

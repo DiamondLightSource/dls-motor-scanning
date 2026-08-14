@@ -10,9 +10,11 @@ without EPICS or a display.
 """
 
 import datetime
+import os
 from collections.abc import Iterator, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
+from importlib import import_module
 from math import sqrt
 from pathlib import Path
 from statistics import fmean, pstdev
@@ -316,23 +318,40 @@ def _padded(low: float, high: float) -> tuple[float, float]:
     return low, high
 
 
+def interactive_backend() -> str | None:
+    """Return a GUI backend that is safe to use here, or None if there is none.
+
+    Only Qt will do. cothread runs the GUI event loop, and ``cothread/qt.py``
+    supports PyQt6/5/4 and nothing else; matplotlib left to choose for itself
+    falls through its candidate list to ``tkagg``, which segfaults the
+    interpreter once cothread has been imported. Rather than risk that, this
+    checks for a working Qt binding up front and reports honestly when it is
+    missing, so the caller can skip the plot instead of dying.
+    """
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return None
+    for binding in ("PyQt6.QtWidgets", "PyQt5.QtWidgets"):
+        try:
+            import_module(binding)
+        except ImportError:
+            # Either the binding is not installed, or its shared libraries
+            # (libGL and friends) are not present on this machine.
+            continue
+        return "qtagg"
+    return None
+
+
 def build_figure(
     config: ScanConfig,
     info: MotorInfo,
     points: Sequence[ScanPoint],
     started: datetime.datetime,
     summary: ScanSummary,
-    interactive: bool,
 ) -> Any:
     """Build the multi-panel figure of position error and move time.
 
-    When ``interactive`` is false the Agg backend is selected before pyplot is
-    imported, so no GUI toolkit is initialised at all.
+    Whichever backend the caller has selected is used as-is.
     """
-    import matplotlib
-
-    if not interactive:
-        matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     errors = [point.error for point in points]
@@ -437,19 +456,37 @@ def perform_scan(config: ScanConfig) -> list[ScanPoint]:
     summary = summarise_scan(points)
     print_summary(config, info, signed_step, n_points, started, summary)
 
-    if config.save_png or config.show_plot:
-        fig = build_figure(
-            config, info, points, started, summary, interactive=config.show_plot
-        )
-        if config.save_png:
-            fig.savefig(f"{basename}.png")
-            print(f"  Plot saved in {basename}.png")
-    if config.write_txt:
-        print(f"  Data saved in {basename}.txt\n")
-    if config.show_plot:
+    # The png is written first, under Agg, so that it survives even if setting
+    # up the interactive window afterwards fails or crashes the interpreter.
+    if config.save_png:
+        import matplotlib
+
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        # matplotlib annotates show's **kwargs as Unknown, which strict mode flags
-        plt.show()  # pyright: ignore[reportUnknownMemberType]
+        fig = build_figure(config, info, points, started, summary)
+        fig.savefig(f"{basename}.png")
+        plt.close(fig)
+        print(f"  Plot saved in {basename}.png")
+    if config.write_txt:
+        print(f"  Data saved in {basename}.txt\n")
+
+    if config.show_plot:
+        import matplotlib
+
+        backend = interactive_backend()
+        if backend is None:
+            print(
+                "  No usable Qt backend (needs PyQt5 or PyQt6 and a display), "
+                "so the interactive plot has been skipped"
+            )
+        else:
+            matplotlib.use(backend)
+            import matplotlib.pyplot as plt
+
+            build_figure(config, info, points, started, summary)
+            # matplotlib annotates show's **kwargs as Unknown, which strict
+            # mode flags
+            plt.show()  # pyright: ignore[reportUnknownMemberType]
 
     return points

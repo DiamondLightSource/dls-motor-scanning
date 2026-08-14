@@ -83,14 +83,17 @@ prefer:
 dls-motor-scanning scan PS-MO-WIRE-01:Y 40 45 0.5 0 --no-plot
 ```
 
-which selects matplotlib's Agg backend before any GUI toolkit is loaded and just
-writes the png.
+which skips the interactive window entirely and just writes the png.
 
 > **A note on backends.** cothread integrates with Qt and not with Tk, and the
-> two segfault if combined. `PyQt5` is therefore a dependency so that matplotlib
-> resolves to `qtagg` rather than falling back to `tkagg`. If you see the tool
-> die silently after printing its statistics, check
-> `python -c "import matplotlib; print(matplotlib.get_backend())"`.
+> two segfault if combined. `PyQt5` is therefore a dependency, and the tool
+> selects `qtagg` explicitly rather than letting matplotlib work through its
+> own candidate list, which would fall back to `tkagg`. If Qt cannot be
+> imported, or `DISPLAY` is unset, the interactive plot is skipped with a
+> message instead of taking the process down with it.
+>
+> The png is always rendered under Agg and written to disk *before* any GUI
+> toolkit is touched, so a display problem can never cost you the saved plot.
 
 ## Calibrating a feedback device
 

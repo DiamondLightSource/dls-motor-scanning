@@ -25,7 +25,7 @@ dynamic = ["version"]
 license.file = "LICENSE"
 readme = "README.md"
 # cothread's _coroutine extension crashes the interpreter on import under 3.14
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.12"
 
 [dependency-groups]
 dev = [
