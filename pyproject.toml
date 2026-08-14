@@ -10,7 +10,6 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
 ]
 description = "A tool to facilitate automatic scanning of an EPICS motor"
 dependencies = [
@@ -25,11 +24,13 @@ dependencies = [
 dynamic = ["version"]
 license.file = "LICENSE"
 readme = "README.md"
-requires-python = ">=3.11,<3.12"
+# cothread's _coroutine extension crashes the interpreter on import under 3.14
+requires-python = ">=3.11,<3.14"
 
 [dependency-groups]
 dev = [
     "copier",
+    "pandas-stubs",
     "pre-commit",
     "pyright",
     "pytest",

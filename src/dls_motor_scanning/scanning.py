@@ -340,7 +340,8 @@ def build_figure(
 
     n_rows = 3 if config.extra_pv else 2
     fig, axes = plt.subplots(n_rows, 1, figsize=(8.27, 11.69))
-    fig.suptitle(
+    # matplotlib annotates suptitle's **kwargs as Unknown, which strict mode flags
+    fig.suptitle(  # pyright: ignore[reportUnknownMemberType]
         f"Step Scanning {config.motor}\n"
         f"Start={config.start} Stop={config.stop} "
         f"Step={abs(config.step)} Delay={config.delay}\n"
@@ -448,6 +449,7 @@ def perform_scan(config: ScanConfig) -> list[ScanPoint]:
     if config.show_plot:
         import matplotlib.pyplot as plt
 
-        plt.show()
+        # matplotlib annotates show's **kwargs as Unknown, which strict mode flags
+        plt.show()  # pyright: ignore[reportUnknownMemberType]
 
     return points
