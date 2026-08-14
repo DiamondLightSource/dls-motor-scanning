@@ -37,11 +37,35 @@ def main():
         "delay", type=float, help="Settling time in seconds to wait after each move"
     )
     parser.add_argument(
-        "extra_pv",
+        "--extra-pv",
         type=str,
-        nargs="?",
         default=None,
+        metavar="PV",
         help="Additional PV to read at each step and plot against position",
+    )
+
+    parser.add_argument(
+        "--trigger-pv",
+        type=str,
+        default=None,
+        metavar="PV",
+        help="Additional PV to trigger between moves",
+    )
+
+    parser.add_argument(
+        "--trigger-width",
+        type=float,
+        default=1.0,
+        metavar="SECS",
+        help="Trigger width (default: 1.0)",
+    )
+
+    parser.add_argument(
+        "--trigger-post-delay",
+        type=float,
+        default=0.0,
+        metavar="SECS",
+        help="Post trigger delay (default: 0.0)",
     )
 
     args = parser.parse_args()
@@ -52,6 +76,9 @@ def main():
     step = args.step
     delay = args.delay
     extra_pv = args.extra_pv
+    trigger_pv = args.trigger_pv
+    trigger_width = args.trigger_width
+    trigger_post_delay = args.trigger_post_delay
 
     print("Motor step scanning...")
 
@@ -159,6 +186,12 @@ def main():
             min_time = diff_time
         mean_time = mean_time + diff_time
         time_array.append(diff_time)
+
+        if trigger_pv is not None:
+            caput(trigger_pv, 1, wait=True, timeout=TIMEOUT)
+            time.sleep(trigger_width)
+            caput(trigger_pv, 0, wait=True, timeout=TIMEOUT)
+            time.sleep(trigger_post_delay)
 
         if extra_pv is not None:
             print(
