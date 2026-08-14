@@ -13,7 +13,15 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 description = "A tool to facilitate automatic scanning of an EPICS motor"
-dependencies = ["numpy","cothread", "epicscorelibs", "matplotlib", "pandas", "PyQt5"] # Add project dependencies here, e.g. ["click", "numpy"]
+dependencies = [
+    "cothread",
+    "epicscorelibs",
+    "matplotlib",
+    "numpy",
+    "pandas",
+    "PyQt5",
+    "typer",
+]
 dynamic = ["version"]
 license.file = "LICENSE"
 readme = "README.md"
@@ -32,7 +40,7 @@ dev = [
 ]
 
 [project.scripts]
-dls-motor-scanning = "dls_motor_scanning.dls_motor_scanning:main"
+dls-motor-scanning = "dls_motor_scanning.cli:app"
 
 [project.urls]
 GitHub = "https://github.com/DiamondLightSource/dls-motor-scanning"
