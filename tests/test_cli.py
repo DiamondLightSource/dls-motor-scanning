@@ -1,5 +1,7 @@
 """Tests for the command line interface."""
 
+import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -11,10 +13,29 @@ from conftest import FakeCatools
 from dls_motor_scanning import __version__
 from dls_motor_scanning.cli import app
 
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def cli_environment() -> dict[str, str]:
+    """Environment that makes typer's help output predictable.
+
+    Rich forces terminal mode when GITHUB_ACTIONS is set, and then colours each
+    fragment of an option name separately, so "--extra-pv" is not a literal
+    substring of the rendered help. A wide COLUMNS additionally stops long
+    option names being wrapped across lines.
+    """
+    environment = dict(os.environ)
+    environment.pop("FORCE_COLOR", None)
+    environment.pop("GITHUB_ACTIONS", None)
+    environment.update(NO_COLOR="1", TERM="dumb", COLUMNS="200")
+    return environment
+
 
 def run(*args: str) -> str:
+    """Run the CLI and return its output, stripped of any residual styling."""
     cmd = [sys.executable, "-m", "dls_motor_scanning", *args]
-    return subprocess.check_output(cmd).decode()
+    output = subprocess.check_output(cmd, env=cli_environment()).decode()
+    return ANSI_ESCAPE.sub("", output)
 
 
 def test_cli_version():
@@ -51,7 +72,9 @@ def test_calibrate_help_documents_the_options():
 
 def test_no_arguments_shows_help_rather_than_failing():
     cmd = [sys.executable, "-m", "dls_motor_scanning"]
-    result = subprocess.run(cmd, capture_output=True, check=False)
+    result = subprocess.run(
+        cmd, capture_output=True, check=False, env=cli_environment()
+    )
     assert b"scan" in result.stdout
 
 
