@@ -8,8 +8,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
 ]
 description = "A tool to facilitate automatic scanning of an EPICS motor"
 dependencies = [
@@ -24,7 +22,11 @@ dependencies = [
 dynamic = ["version"]
 license.file = "LICENSE"
 readme = "README.md"
-# cothread's _coroutine extension crashes the interpreter on import under 3.14
+# 3.11 only. cothread's _coroutine extension switches interpreter stacks, which
+# ties it tightly to the CPython version: it crashes on import under 3.14, and
+# under 3.12/3.13 it segfaults once it is driving a Qt event loop for the plot.
+# Pinning here is also what makes `uvx dls-motor-scanning` pick a working
+# interpreter without the caller having to pass --python.
 requires-python = ">=3.11,<3.12"
 
 [dependency-groups]
