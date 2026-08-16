@@ -31,8 +31,11 @@ requires-python = ">=3.11,<3.12"
 
 [dependency-groups]
 dev = [
+<<<<<<< before updating
     "copier",
     "pandas-stubs",
+=======
+>>>>>>> after updating
     "pre-commit",
     "pyright",
     "pytest",
