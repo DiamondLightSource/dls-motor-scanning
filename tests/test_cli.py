@@ -1,5 +1,6 @@
 """Tests for the command line interface."""
 
+import json
 import os
 import re
 import subprocess
@@ -48,6 +49,7 @@ def test_help_lists_every_command():
     assert "scan" in help_text
     assert "verify" in help_text
     assert "calibrate" in help_text
+    assert "gui" in help_text
 
 
 def test_scan_help_documents_the_options():
@@ -284,3 +286,24 @@ def test_verify_command_rejects_a_single_repeat():
     )
     assert result.exit_code != 0
     assert "--repeats" in result.output
+
+
+def test_motor_info_prints_the_motor_fields_as_json(fake_ca: FakeCatools):
+    result = CliRunner().invoke(app, ["motor-info", "SIM-MO-TEST-01:Y"])
+    assert result.exit_code == 0, result.output
+    state = json.loads(result.stdout)
+    assert state["velocity"] == 15.0
+    assert state["egu"] == "mm"
+
+
+def test_motor_info_reports_a_motor_it_cannot_read(
+    fake_ca: FakeCatools, monkeypatch: pytest.MonkeyPatch
+):
+    def unreachable(*args: object, **kwargs: object) -> None:
+        raise TimeoutError("SIM-MO-TEST-01:Y.RBV: timed out")
+
+    monkeypatch.setattr(fake_ca, "caget", unreachable)
+    result = CliRunner().invoke(app, ["motor-info", "SIM-MO-TEST-01:Y"])
+    assert result.exit_code == 1
+    assert "Could not read SIM-MO-TEST-01:Y" in result.stderr
+    assert result.stdout == ""

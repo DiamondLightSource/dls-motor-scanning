@@ -1,5 +1,7 @@
 """Tests for the scan logic."""
 
+import datetime
+import io
 import subprocess
 import sys
 from pathlib import Path
@@ -8,15 +10,23 @@ import pytest
 
 from conftest import FakeCatools
 from dls_motor_scanning.scanning import (
+    MotorInfo,
     ScanConfig,
+    ScanOutput,
     ScanPoint,
+    build_verify_figure,
+    format_summary,
     headings,
     interactive_backend,
     perform_scan,
     plan_scan,
     plan_targets,
+    print_summary,
+    read_motor_state,
+    read_scan_file,
     repeatability,
     row,
+    scan_steps,
     summarise,
     summarise_scan,
 )
@@ -378,3 +388,144 @@ def test_perform_scan_repeats_record_both_directions(
     lines = next(tmp_path.glob("Scan_*_x2.txt")).read_text().splitlines()
     assert lines[0] == "Desired Actual MoveTime Cycle Direction"
     assert [line.split()[-1] for line in lines[1:9]] == ["+1"] * 4 + ["-1"] * 4
+
+
+def test_read_scan_file_recovers_what_a_verify_scan_wrote(
+    fake_ca: FakeCatools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.chdir(tmp_path)
+    fake_ca.signals["SIM-MO-POT-01:POS"] = lambda position: position + 0.002
+    written = perform_scan(
+        config(extra_pv="SIM-MO-POT-01:POS", compare=True, repeats=2, timestamp=True)
+    )
+
+    recorded = read_scan_file(next(tmp_path.glob("Verify_*_x2.txt")))
+
+    assert recorded.points == written
+    assert recorded.config.motor == "SIM-MO-TEST-01:Y"
+    assert recorded.config.extra_pv == "SIM-MO-POT-01:POS"
+    assert (recorded.config.start, recorded.config.stop) == (40.0, 42.0)
+    assert (recorded.config.step, recorded.config.repeats) == (0.5, 2)
+    assert recorded.config.compare
+
+
+def test_read_scan_file_rejects_a_file_it_did_not_write(tmp_path: Path):
+    stranger = tmp_path / "notes.txt"
+    stranger.write_text("Desired Actual MoveTime\n1 1 1\n")
+    with pytest.raises(ValueError, match="not named like"):
+        read_scan_file(stranger)
+
+
+def test_scan_steps_waits_with_the_sleep_it_is_given(fake_ca: FakeCatools):
+    waits: list[float] = []
+    scan = config(delay=0.25)
+    points = list(scan_steps(scan, plan_targets(scan), sleep=waits.append))
+    assert len(points) == 4
+    assert waits == [0.25] * 4
+
+
+def test_format_summary_is_what_print_summary_prints(
+    capsys: pytest.CaptureFixture[str],
+):
+    points = [
+        ScanPoint(demand=1.0, actual=0.999, move_time=0.1, extra=0.998),
+        ScanPoint(demand=2.0, actual=1.999, move_time=0.1, extra=2.001),
+    ]
+    scan = config(extra_pv="SIM-MO-POT-01:POS", compare=True)
+    info = MotorInfo(ueip="1", velo="1", accl="1", egu="mm")
+    started = datetime.datetime(2026, 9, 23)
+    summary = summarise_scan(points, compare=True)
+
+    text = format_summary(scan, info, 0.5, 2, started, summary)
+    print_summary(scan, info, 0.5, 2, started, summary)
+
+    assert text == capsys.readouterr().out
+    # Verifying is about the pot, not the stage against its demand
+    assert "Position error" not in text
+    assert "Actual Position - SIM-MO-POT-01:POS (mm)" in text
+
+
+@pytest.mark.parametrize("readings", [1, 3, 6, 16])
+def test_verify_figure_draws_a_scan_still_in_progress(readings: int):
+    """The GUI redraws as readings arrive, before every group is complete."""
+    from matplotlib.figure import Figure
+
+    scan = config(extra_pv="SIM-MO-POT-01:POS", compare=True, repeats=2)
+    points = [
+        ScanPoint(
+            demand=target.demand,
+            actual=target.demand,
+            move_time=0.1,
+            extra=target.demand + 0.001 * index % 3,
+            cycle=target.cycle,
+            direction=target.direction,
+        )
+        for index, target in enumerate(plan_targets(scan)[:readings])
+    ]
+    figure = Figure()
+    info = MotorInfo(ueip="1", velo="1", accl="1", egu="mm")
+    summary = summarise_scan(points, compare=True)
+    started = datetime.datetime(2026, 9, 23)
+
+    assert build_verify_figure(scan, info, points, started, summary, figure) is figure
+    assert len(figure.axes) == 3
+    # Drawing again into the same figure replaces the panels, not adds to them
+    build_verify_figure(scan, info, points, started, summary, figure)
+    assert len(figure.axes) == 3
+    figure.savefig(io.BytesIO(), format="png")  # pyright: ignore[reportUnknownMemberType]
+
+
+def test_scan_output_follows_what_perform_scan_prints(
+    fake_ca: FakeCatools,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    monkeypatch.chdir(tmp_path)
+    fake_ca.signals["SIM-MO-POT-01:POS"] = lambda position: position + 0.002
+    written = perform_scan(
+        config(extra_pv="SIM-MO-POT-01:POS", compare=True, repeats=2, save_png=True)
+    )
+    printed = capsys.readouterr().out.splitlines()
+
+    output = ScanOutput()
+    fed = [output.feed(line) for line in printed]
+
+    assert [point for point in fed if point is not None] == written
+    assert output.points == written
+    assert output.summary[0].startswith("*****")
+    assert any("Repeatability of Actual Position" in line for line in output.summary)
+    assert output.data_file is not None
+    assert (tmp_path / output.data_file).exists()
+
+
+def test_scan_output_keeps_the_readings_of_a_scan_cut_short():
+    output = ScanOutput()
+    for line in [
+        "Motor step scanning...",
+        "Moving to start position of 40.0",
+        "Desired Actual MoveTime SIM:POT Actual-Extra Cycle Direction",
+        "40.5 40.499 0.1 40.5 -0.001 1 +1",
+        "41.0 40.999 0.1 41.0",  # cut off mid-line
+    ]:
+        output.feed(line)
+    assert len(output.points) == 1
+    assert output.points[0].extra == 40.5
+    assert output.points[0].direction == 1
+    assert output.summary == []
+    assert output.data_file is None
+
+
+def test_read_motor_state_reads_what_the_gui_plans_with(fake_ca: FakeCatools):
+    state = read_motor_state("SIM-MO-TEST-01:Y")
+    assert state["egu"] == "mm"
+    assert state["velocity"] == 15.0
+    assert state["acceleration_time"] == 0.5
+    assert set(state) == {
+        "position",
+        "egu",
+        "velocity",
+        "acceleration_time",
+        "low_limit",
+        "high_limit",
+    }

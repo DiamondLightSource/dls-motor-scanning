@@ -7,7 +7,7 @@
 
 Tools for characterising the motion performance of EPICS motors.
 
-Three commands are provided:
+Four commands are provided:
 
 - `scan` drives a motor through a range in fixed steps, recording the position
   actually reached and the time each move took, then reports the positioning
@@ -18,6 +18,7 @@ Three commands are provided:
 - `verify` scans a motor like `scan`, and reports how far another PV, such as
   the calibrated calc record, is from the motor readback at every step, and
   optionally the unidirectional and bidirectional repeatability.
+- `gui` opens a window that plans, runs and views `verify` scans.
 
 What            | Where
 :---:           | :---:
@@ -214,6 +215,43 @@ If `--step` doesn't divide the range exactly, the last target falls short of
 `STOP`. Avoid a step that is a multiple of a periodic error in the device, such
 as a leadscrew's pitch, because every target then lands at the same phase and
 the error doesn't show.
+
+## The verify GUI
+
+```
+dls-motor-scanning gui
+```
+
+This opens a window for the `verify` scan. It needs a display and PyQt5.
+
+1. Enter the motor PV and press **Read motor**. This reads the position, soft
+   limits, EGU, VELO and ACCL. The compare PV defaults to `<motor>:POT`.
+2. Set the start, stop, step, repeats and settling delay. With each change,
+   the **Plan** tab redraws the motor's position against time, the sawtooth it
+   will follow, with a dot at each reading. The number of moves, the estimated
+   time and the finishing time are shown under the form. So are warnings about
+   a range outside the soft limits, or a step that doesn't divide the range.
+3. Press **Run** and confirm. This runs the `verify` command above in a
+   separate process, in the output folder, and follows what it prints. Its
+   output is echoed to the terminal too. The **Data** tab fills in with every
+   reading. The **Results** tab redraws every 10 seconds, and the progress bar
+   re-estimates the time left from the pace so far. **Stop** ends the scan
+   and keeps every reading so far. The motor still finishes the move it was
+   given.
+4. At the end, `verify` writes its usual `Verify_...` txt and png to the
+   output folder, and its summary appears in the **Summary** tab. A stopped
+   scan has its txt but no png. The Results tab's toolbar can save the plot.
+
+**Open data file...** loads any earlier `Verify_*.txt` into the Results,
+Summary and Data tabs. It fills in the form too, so the same scan can be run
+again. Each plot has a toolbar to zoom, pan and save.
+
+The time estimate models each move as a trapezoid: ACCL seconds to reach VELO,
+a cruise, and ACCL seconds to stop. It then adds the **Overhead per move** you
+enter, for the controller settling and the put completing, which the model
+doesn't capture. To find it, compare the mean move time from an earlier scan's
+summary with the trapezoid. For example, a 0.5 mm step at VELO 0.5 and ACCL 0.5
+is 1.5 s, but a motorPLC axis measured 4.0 s, so its overhead is 2.5 s.
 
 ## Development
 

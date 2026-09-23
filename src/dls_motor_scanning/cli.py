@@ -1,5 +1,6 @@
 """Command line interface for the DLS motor scanning tools."""
 
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
@@ -201,8 +202,9 @@ def verify(
     full range of the stage as START and STOP: one pass reports the readback
     minus --compare-pv at each step, as statistics, a column in the txt file
     and an extra plot. With --repeats, the range is traversed there and back
-    that many times, and the repeatability of both that difference and the
-    stage's own positioning is reported in the style of ISO 230-2.
+    that many times, and the repeatability of that difference is reported in
+    the style of ISO 230-2. The stage's own positioning against its demand is
+    left out, as it says nothing about the calibration.
     """
     from .scanning import ScanConfig
 
@@ -310,3 +312,35 @@ def calibrate(
 
     print("\nExcel formula:")
     print(excel_formula(calibration, excel_cell))
+
+
+@app.command(hidden=True)
+def motor_info(motor: Motor) -> None:
+    """Print the motor fields the GUI plans with, as JSON.
+
+    The GUI runs this in a separate process, so Channel Access never shares a
+    thread with Qt.
+    """
+    import json
+
+    from .scanning import read_motor_state
+
+    try:
+        state = read_motor_state(motor)
+    except Exception as error:  # cothread raises ca_nothing on a timeout
+        print(f"Could not read {motor}: {error}", file=sys.stderr)
+        raise typer.Exit(1) from error
+    print(json.dumps(state))
+
+
+@app.command()
+def gui() -> None:
+    """Open a window to plan, run and view verify scans.
+
+    Set the same options as verify, preview the motor's position against time
+    with the number of moves and an estimate of the time taken, then run it and
+    watch the results fill in. Earlier verify data files can be opened too.
+    """
+    from .gui import main
+
+    main()

@@ -12,9 +12,11 @@ without EPICS or a display.
 """
 
 import datetime
+import io
 import os
+import re
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout
 from dataclasses import dataclass
 from importlib import import_module
 from math import isclose, sqrt
@@ -355,6 +357,135 @@ def plan_targets(config: ScanConfig) -> list[Target]:
     return targets
 
 
+@dataclass(frozen=True)
+class RecordedScan:
+    """A scan read back from its data file."""
+
+    config: ScanConfig
+    points: list[ScanPoint]
+    started: datetime.datetime | None
+
+
+FILENAME_PATTERN = re.compile(
+    r"^(?P<prefix>Scan|Verify)_(?P<motor>.+)_"
+    r"(?P<date>\d{4}-\d\d-\d\d-\d\d:\d\d:\d\d)_"
+    r"(?P<start>[-+.\deE]+)_(?P<stop>[-+.\deE]+)_(?P<step>[-+.\deE]+?)"
+    r"(?:_x(?P<repeats>\d+))?$"
+)
+"""How :func:`scan_filename` names the outputs, so the settings can be recovered."""
+
+
+def is_heading(fields: Sequence[str]) -> bool:
+    """Whether ``fields`` is the heading line of a data file."""
+    return list(fields[:3]) == [COLUMN_DESIRED, COLUMN_ACTUAL, COLUMN_MOVE_TIME]
+
+
+def extra_pv_column(columns: Sequence[str]) -> str | None:
+    """The extra PV's name, which heads the column after MoveTime, if any."""
+    known = {COLUMN_DIFFERENCE, COLUMN_CYCLE, COLUMN_DIRECTION, COLUMN_TIMESTAMP}
+    return columns[3] if len(columns) > 3 and columns[3] not in known else None
+
+
+def parse_row(columns: Sequence[str], fields: Sequence[str]) -> ScanPoint:
+    """Read one row of a data file, under the heading ``columns``.
+
+    Raises :class:`ValueError` if the row doesn't fit the heading.
+    """
+    if len(fields) != len(columns):
+        raise ValueError(f"expected {len(columns)} fields, got {len(fields)}")
+    index = {name: i for i, name in enumerate(columns)}
+    extra_pv = extra_pv_column(columns)
+
+    def field(name: str | None) -> str | None:
+        return fields[index[name]] if name in index else None
+
+    cycle = field(COLUMN_CYCLE)
+    direction = field(COLUMN_DIRECTION)
+    extra = field(extra_pv)
+    return ScanPoint(
+        demand=float(fields[0]),
+        actual=float(fields[1]),
+        move_time=float(fields[2]),
+        extra=None if extra is None else float(extra),
+        timestamp=field(COLUMN_TIMESTAMP),
+        cycle=None if cycle is None else int(cycle),
+        direction=None if direction is None else int(direction),
+    )
+
+
+class ScanOutput:
+    """Follows what :func:`perform_scan` prints, a line at a time.
+
+    Lets another process, such as the GUI, watch a scan run by the command
+    line: the heading, then a row for each reading, then the summary.
+    """
+
+    def __init__(self) -> None:
+        self.columns: list[str] | None = None
+        self.points: list[ScanPoint] = []
+        self.summary: list[str] = []
+        self.data_file: str | None = None
+
+    def feed(self, line: str) -> ScanPoint | None:
+        """Take in one printed line, returning the reading if it was one."""
+        fields = line.split()
+        if is_heading(fields):
+            self.columns = fields
+            return None
+        if self.columns is not None and not self.summary:
+            try:
+                point = parse_row(self.columns, fields)
+            except ValueError:
+                pass
+            else:
+                self.points.append(point)
+                return point
+        if self.points and (self.summary or line.startswith("*****")):
+            self.summary.append(line)
+        match = re.match(r"\s*Data saved in (.+\.txt)\s*$", line)
+        if match:
+            self.data_file = match[1]
+        return None
+
+
+def read_scan_file(path: Path) -> RecordedScan:
+    """Read back a data file written by :func:`perform_scan`.
+
+    The motor, range, step and repeats come from the file name, as the file
+    itself doesn't record them. The extra PV is the column after MoveTime.
+    Raises :class:`ValueError` if the file isn't one this tool wrote.
+    """
+    match = FILENAME_PATTERN.match(path.stem)
+    if match is None:
+        raise ValueError(f"{path.name} is not named like a scan data file")
+    lines = [line.split() for line in path.read_text().splitlines() if line.strip()]
+    if not lines:
+        raise ValueError(f"{path.name} is empty")
+    columns = lines[0]
+    if not is_heading(columns):
+        raise ValueError(f"{path.name} does not start with the expected columns")
+
+    extra_pv = extra_pv_column(columns)
+    points = [parse_row(columns, fields) for fields in lines[1:]]
+    if not points:
+        raise ValueError(f"{path.name} has no data rows")
+
+    repeats = match["repeats"]
+    config = ScanConfig(
+        motor=match["motor"],
+        start=float(match["start"]),
+        stop=float(match["stop"]),
+        step=float(match["step"]),
+        delay=0.0,
+        extra_pv=extra_pv,
+        compare=COLUMN_DIFFERENCE in columns,
+        repeats=None if repeats is None else int(repeats),
+        timestamp=COLUMN_TIMESTAMP in columns,
+    )
+    started = datetime.datetime.strptime(match["date"], "%Y-%m-%d-%H:%M:%S")
+    return RecordedScan(config=config, points=points, started=started)
+
+
 def scan_filename(config: ScanConfig, started: datetime.datetime) -> str:
     """Build the base name shared by the txt and png outputs."""
     date_text = started.strftime("%Y-%m-%d-%H:%M:%S")
@@ -388,6 +519,32 @@ def read_motor_info(motor: str) -> MotorInfo:
     return MotorInfo(ueip=str(ueip), velo=str(velo), accl=str(accl), egu=str(egu))
 
 
+MOTOR_STATE_FIELDS = {
+    "position": PV_RBV,
+    "egu": PV_EGU,
+    "velocity": PV_VELO,
+    "acceleration_time": PV_ACCL,
+    "low_limit": ".LLM",
+    "high_limit": ".HLM",
+}
+"""What :func:`read_motor_state` reads, by the name it returns it under."""
+
+
+def read_motor_state(motor: str, timeout: float = 3.0) -> dict[str, float | str]:
+    """Read the motor fields the GUI plans a scan with, in one round trip.
+
+    Raises the Channel Access error if any of them can't be read in time.
+    """
+    ca = _catools()
+    values = ca.caget(
+        [motor + field for field in MOTOR_STATE_FIELDS.values()], timeout=timeout
+    )
+    return {
+        name: str(value) if name == "egu" else float(value)
+        for name, value in zip(MOTOR_STATE_FIELDS, values, strict=True)
+    }
+
+
 def _utc_timestamp(value: Any) -> str:
     """Render the EPICS timestamp carried by ``value`` as ISO 8601 UTC."""
     return datetime.datetime.fromtimestamp(value.timestamp, tz=datetime.UTC).strftime(
@@ -402,10 +559,20 @@ def move_to_start(config: ScanConfig) -> None:
     ca.caput(config.motor + PV_VAL, config.start, wait=True, timeout=TIMEOUT)
 
 
-def scan_steps(config: ScanConfig, targets: Sequence[Target]) -> Iterator[ScanPoint]:
-    """Step the motor through the targets, yielding a :class:`ScanPoint` for each."""
+def scan_steps(
+    config: ScanConfig,
+    targets: Sequence[Target],
+    sleep: Callable[[float], None] | None = None,
+) -> Iterator[ScanPoint]:
+    """Step the motor through the targets, yielding a :class:`ScanPoint` for each.
+
+    ``sleep`` waits out the settling and trigger delays. It defaults to
+    :func:`time.sleep`; a GUI passes ``cothread.Sleep`` so that its event loop
+    keeps running. The caller can stop the scan early by no longer iterating.
+    """
     import time
 
+    sleep = sleep or time.sleep
     ca = _catools()
     for target in targets:
         demand = target.demand
@@ -417,7 +584,7 @@ def scan_steps(config: ScanConfig, targets: Sequence[Target]) -> Iterator[ScanPo
 
         # Wait for the motor to settle before reading back
         if config.delay > 0:
-            time.sleep(config.delay)
+            sleep(config.delay)
 
         stamp = None
         if config.timestamp:
@@ -431,9 +598,9 @@ def scan_steps(config: ScanConfig, targets: Sequence[Target]) -> Iterator[ScanPo
 
         if config.trigger_pv:
             ca.caput(config.trigger_pv, 1, wait=True, timeout=TIMEOUT)
-            time.sleep(config.trigger_width)
+            sleep(config.trigger_width)
             ca.caput(config.trigger_pv, 0, wait=True, timeout=TIMEOUT)
-            time.sleep(config.trigger_post_delay)
+            sleep(config.trigger_post_delay)
 
         yield ScanPoint(
             demand=demand,
@@ -532,6 +699,21 @@ def print_summary(
             info,
             summary.difference_repeatability,
         )
+
+
+def format_summary(
+    config: ScanConfig,
+    info: MotorInfo,
+    signed_step: float,
+    n_points: int,
+    started: datetime.datetime,
+    summary: ScanSummary,
+) -> str:
+    """The statistics block :func:`print_summary` prints, as text."""
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        print_summary(config, info, signed_step, n_points, started, summary)
+    return buffer.getvalue()
 
 
 def print_repeatability(label: str, info: MotorInfo, figures: Repeatability) -> None:
@@ -682,6 +864,7 @@ def build_verify_figure(
     points: Sequence[ScanPoint],
     started: datetime.datetime,
     summary: ScanSummary,
+    fig: Any = None,
 ) -> Any:
     """Build the figure for a verify scan: the extra PV against the readback.
 
@@ -690,12 +873,21 @@ def build_verify_figure(
     against the readback. A repeated scan shows the difference as mean and 2s
     per target and direction, each reading's scatter about its mean, and the
     repeatability figures at every target.
-    """
-    import matplotlib.pyplot as plt
 
+    It is drawn into ``fig`` if given, which is cleared first, such as a
+    figure embedded in a GUI, or else into a new pyplot figure.
+    """
+    from matplotlib import colormaps
+
+    if fig is None:
+        import matplotlib.pyplot as plt
+
+        fig = plt.figure(figsize=(8.27, 11.69))  # pyright: ignore[reportUnknownMemberType]
+    else:
+        fig.clear()
     compared = [point for point in points if point.difference is not None]
     n_rows = 2 if config.repeats is None else 3
-    fig, axes = plt.subplots(n_rows, 1, figsize=(8.27, 11.69))
+    axes = fig.subplots(n_rows, 1)
     # matplotlib annotates suptitle's **kwargs as Unknown, which strict mode flags
     fig.suptitle(  # pyright: ignore[reportUnknownMemberType]
         f"Verifying {config.extra_pv}\nagainst {config.motor}{PV_RBV}\n"
@@ -772,7 +964,7 @@ def build_verify_figure(
     # Every reading about the mean of its target and direction: the spread
     # here is the repeatability, and a trend from cycle to cycle is drift
     scatter_axes = axes[1]
-    cmap = plt.get_cmap("viridis")
+    cmap = colormaps["viridis"]
     cycles = sorted({point.cycle for point in compared if point.cycle is not None})
     for index, cycle in enumerate(cycles):
         for direction, _, _ in DIRECTIONS:
@@ -881,6 +1073,8 @@ def perform_scan(config: ScanConfig) -> list[ScanPoint]:
             print(line)
             if txt is not None:
                 txt.write(f"{line}\n")
+                # So a scan that is interrupted or killed keeps every reading
+                txt.flush()
             points.append(point)
 
     summary = summarise_scan(points, config.compare)
