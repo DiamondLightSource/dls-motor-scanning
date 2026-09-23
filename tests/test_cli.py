@@ -43,9 +43,10 @@ def test_cli_version():
     assert subprocess.check_output(cmd).decode().strip() == __version__
 
 
-def test_help_lists_both_commands():
+def test_help_lists_every_command():
     help_text = run("--help")
     assert "scan" in help_text
+    assert "verify" in help_text
     assert "calibrate" in help_text
 
 
@@ -175,3 +176,111 @@ def test_calibrate_command_reports_a_missing_column(
 
     assert result.exit_code != 0
     assert "No column named 'adc'" in result.output
+
+
+def test_verify_command_reports_the_readback_minus_the_pv(
+    fake_ca: FakeCatools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.chdir(tmp_path)
+    fake_ca.signals["SIM-MO-POT-01:POS"] = lambda position: position + 0.01
+    result = CliRunner().invoke(
+        app,
+        ["verify", "SIM-MO-TEST-01:Y", "0", "2", "--step", "0.5", "--delay", "0"]
+        + ["--compare-pv", "SIM-MO-POT-01:POS", "--no-plot"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Actual Position - SIM-MO-POT-01:POS (mm)" in result.output
+    worst = re.search(r"Largest disagreement: (\S+)", result.output)
+    assert worst is not None
+    assert float(worst.group(1)) == pytest.approx(0.011)
+    assert list(tmp_path.glob("Verify_*.txt"))
+    assert list(tmp_path.glob("Verify_*.png"))
+
+
+def test_verify_command_needs_a_compare_pv():
+    result = CliRunner().invoke(app, ["verify", "SIM-MO-TEST-01:Y", "0", "2"])
+    assert result.exit_code != 0
+    assert "--compare-pv" in result.output
+
+
+def test_verify_help_documents_the_options():
+    help_text = run("verify", "--help")
+    for option in (
+        "--compare-pv",
+        "--step",
+        "--delay",
+        "--repeats",
+        "--timestamp",
+        "--no-txt",
+        "--no-png",
+        "--no-plot",
+    ):
+        assert option in help_text
+
+
+class Backlash:
+    """A pot that lags the motor by ``gap`` whenever the motion reverses."""
+
+    def __init__(self, gap: float) -> None:
+        self.gap = gap
+        self.reading = 0.0
+
+    def __call__(self, position: float) -> float:
+        self.reading = min(max(self.reading, position - self.gap), position)
+        return self.reading
+
+
+def _no_sleep(seconds: float) -> None:
+    """Skip the default settling delay."""
+
+
+def test_verify_command_defaults_to_twenty_steps_over_the_range(
+    fake_ca: FakeCatools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("time.sleep", _no_sleep)
+    fake_ca.signals["SIM-MO-POT-01:POS"] = lambda position: position
+    result = CliRunner().invoke(
+        app,
+        ["verify", "SIM-MO-TEST-01:Y", "0", "10"]
+        + ["--compare-pv", "SIM-MO-POT-01:POS", "--no-plot", "--no-png"],
+    )
+
+    assert result.exit_code == 0, result.output
+    lines = next(tmp_path.glob("Verify_*_0.0_10.0_0.5.txt")).read_text().splitlines()
+    assert len(lines) == 1 + 20
+    assert "Repeatability" not in result.output
+
+
+def test_verify_command_repeats_report_the_pot_backlash(
+    fake_ca: FakeCatools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.chdir(tmp_path)
+    fake_ca.signals["SIM-MO-POT-01:POS"] = Backlash(0.004)
+    result = CliRunner().invoke(
+        app,
+        ["verify", "SIM-MO-TEST-01:Y", "0", "2", "--step", "0.5", "--delay", "0"]
+        + ["--repeats", "3", "--compare-pv", "SIM-MO-POT-01:POS", "--no-plot"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Repeatability of Actual Position - SIM-MO-POT-01:POS (mm)" in result.output
+    # Verifying is about the pot, so the stage against its demand is left out
+    assert "Demand Position" not in result.output
+    assert "Position error" not in result.output
+    # The pot lags by 0.004 on the way up, and reads true on the way down
+    reversals = re.findall(r"Reversal B \(mean \+ minus mean -\): (\S+)", result.output)
+    assert [float(value) for value in reversals] == pytest.approx([0.004])
+    assert list(tmp_path.glob("Verify_*_x3.txt"))
+    assert list(tmp_path.glob("Verify_*_x3.png"))
+
+
+def test_verify_command_rejects_a_single_repeat():
+    result = CliRunner().invoke(
+        app,
+        ["verify", "SIM-MO-TEST-01:Y", "0", "2", "--repeats", "1"]
+        + ["--compare-pv", "SIM-MO-POT-01:POS"],
+    )
+    assert result.exit_code != 0
+    assert "--repeats" in result.output

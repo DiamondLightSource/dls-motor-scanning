@@ -13,7 +13,10 @@ from typing import Any
 
 from .scanning import (
     COLUMN_ACTUAL,
+    COLUMN_CYCLE,
     COLUMN_DESIRED,
+    COLUMN_DIFFERENCE,
+    COLUMN_DIRECTION,
     COLUMN_MOVE_TIME,
     COLUMN_TIMESTAMP,
 )
@@ -39,7 +42,15 @@ the EPICS record rather than being a free choice.
 CALC_EXPRESSION = "((A^0)*B)+((A^1)*C)+((A^2)*D)+((A^3)*E)+((A^4)*F)+((A^5)*G)"
 """The expression evaluated by the generated calc record."""
 
-SCAN_COLUMNS = (COLUMN_DESIRED, COLUMN_ACTUAL, COLUMN_MOVE_TIME, COLUMN_TIMESTAMP)
+SCAN_COLUMNS = (
+    COLUMN_DESIRED,
+    COLUMN_ACTUAL,
+    COLUMN_MOVE_TIME,
+    COLUMN_DIFFERENCE,
+    COLUMN_CYCLE,
+    COLUMN_DIRECTION,
+    COLUMN_TIMESTAMP,
+)
 """Columns a scan always writes, none of which can be the raw feedback."""
 
 

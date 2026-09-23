@@ -7,7 +7,7 @@
 
 Tools for characterising the motion performance of EPICS motors.
 
-Two commands are provided:
+Three commands are provided:
 
 - `scan` drives a motor through a range in fixed steps, recording the position
   actually reached and the time each move took, then reports the positioning
@@ -15,6 +15,9 @@ Two commands are provided:
 - `calibrate` fits a 5th order polynomial that converts an unscaled feedback
   device, such as a potentiometer read as raw ADC counts, into engineering
   units, and emits it as an EPICS calc record and an Excel formula.
+- `verify` scans a motor like `scan`, and reports how far another PV, such as
+  the calibrated calc record, is from the motor readback at every step, and
+  optionally the unidirectional and bidirectional repeatability.
 
 What            | Where
 :---:           | :---:
@@ -141,6 +144,76 @@ This prints the largest residual of the fit, the six coefficients, a Builder
 `records.calc` entry with them loaded into fields B to G, and an equivalent
 Excel formula referencing `--excel-cell`. The record's `name` and `record` are
 left blank for you to fill in.
+
+## Verifying a calibration
+
+```
+dls-motor-scanning verify MOTOR START STOP --compare-pv PV [options]
+```
+
+Once the calc record is loaded, give the full range of the stage and the
+calibrated PV. The motor readback, ideally from a trusted encoder, is the
+reference:
+
+```
+dls-motor-scanning verify BL01I-MO-STAGE-01:X 0 50 --compare-pv BL01I-MO-POT-01:POS --no-plot
+```
+
+By default this is a single pass from `START` to `STOP` in 20 steps, with a
+0.5 second settling delay, reporting the signed `Actual - PV` at each step. It
+adds an `Actual-Extra` column to the data file, a block of statistics to the
+summary, and a plot of the PV and the difference against the readback. The mean
+is the calibration's offset, the standard deviation its scatter, and the largest
+disagreement the worst case across the travel. The stage's own positioning,
+demand against readback, says nothing about the calibration, so it isn't
+reported or plotted.
+
+### Repeatability
+
+Add `--repeats N` to also measure repeatability. The range is then traversed
+there and back `N` times, so that each target between the two ends is approached
+`N` times moving each way:
+
+```
+dls-motor-scanning verify BL01I-MO-STAGE-01:X 0 50 --compare-pv BL01I-MO-POT-01:POS --repeats 5 --no-plot
+```
+
+The readings at each target are grouped by approach direction and reduced to a
+mean and sample standard deviation `s`, then reported in the style of ISO
+230-2, each at its worst target:
+
+Figure                             | Meaning
+:---                               | :---
+Unidirectional repeatability R+/R- | `4s` of the approaches moving positive / negative
+Reversal B                         | Mean moving positive minus mean moving negative: hysteresis or backlash
+Mean reversal                      | B averaged over every target
+Bidirectional repeatability R      | `max(2s+ + 2s- + abs(B), R+, R-)`, the spread whichever way a target is approached
+Bidirectional accuracy A           | Lowest `mean - 2s` to highest `mean + 2s`, over every target and direction
+
+These are for `Actual - PV`, the calibrated device against the readback. The
+data file gains `Cycle` and `Direction` (`+1` or `-1`) columns, and the outputs
+are named `Verify_..._x<N>`. The plot has three panels:
+
+- `RBV - PV` at each target, as mean and `2s` for each direction, over the band
+  of A. The shape is the calibration's systematic error, the gap between the
+  directions is the reversal.
+- Each reading minus the mean of its target and direction, coloured by cycle.
+  The spread is the repeatability, and a steady move from cycle to cycle is
+  drift.
+- R+, R-, |B| and R at every target, whose worst are the printed figures.
+
+Option              | Effect
+:---                | :---
+`--compare-pv PV`   | The PV to compare with the motor readback (required)
+`--step EGU`        | Step size (default: a 20th of the range)
+`--delay SECS`      | Settling time after each move (default 0.5)
+`--repeats N`       | Scan there and back `N` times (at least 2) and report repeatability
+`--timestamp`, `--no-txt`, `--no-png`, `--no-plot` | As for `scan`
+
+If `--step` doesn't divide the range exactly, the last target falls short of
+`STOP`. Avoid a step that is a multiple of a periodic error in the device, such
+as a leadscrew's pitch, because every target then lands at the same phase and
+the error doesn't show.
 
 ## Development
 

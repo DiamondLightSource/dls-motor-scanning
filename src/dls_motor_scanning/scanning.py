@@ -2,7 +2,9 @@
 
 The motor is driven from ``start`` to ``stop`` in fixed steps. At each step the
 readback position and the time the move took are recorded, so that positioning
-accuracy and repeatability can be characterised.
+accuracy and repeatability can be characterised. Optionally the range is
+traversed back and forth a number of times, and the unidirectional and
+bidirectional repeatability are worked out in the style of ISO 230-2.
 
 Channel Access and matplotlib are imported lazily by the functions that need
 them, so this module can be imported (and ``--help`` rendered) in environments
@@ -11,22 +13,24 @@ without EPICS or a display.
 
 import datetime
 import os
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from importlib import import_module
-from math import sqrt
+from math import isclose, sqrt
 from pathlib import Path
-from statistics import fmean, pstdev
+from statistics import fmean, pstdev, stdev
 from typing import Any
 
 __all__ = [
     "MotorInfo",
+    "Repeatability",
     "ScanConfig",
     "ScanPoint",
     "ScanSummary",
     "Statistics",
     "perform_scan",
+    "repeatability",
     "summarise_scan",
 ]
 
@@ -44,6 +48,9 @@ COLUMN_DESIRED = "Desired"
 COLUMN_ACTUAL = "Actual"
 COLUMN_MOVE_TIME = "MoveTime"
 COLUMN_TIMESTAMP = "Timestamp(UTC)"
+COLUMN_DIFFERENCE = "Actual-Extra"
+COLUMN_CYCLE = "Cycle"
+COLUMN_DIRECTION = "Direction"
 """Column headings of the data file.
 
 The extra PV, when there is one, is headed with its own name. The calibrate
@@ -65,6 +72,10 @@ class ScanConfig:
     trigger_width: float = 1.0
     trigger_post_delay: float = 0.0
     timestamp: bool = False
+    compare: bool = False
+    """Report how far the extra PV is from the readback, to verify a calibration."""
+    repeats: int | None = None
+    """Bidirectional cycles to run for a repeatability test, or None for one pass."""
     write_txt: bool = True
     save_png: bool = True
     show_plot: bool = True
@@ -89,11 +100,19 @@ class ScanPoint:
     move_time: float
     extra: float | None = None
     timestamp: str | None = None
+    cycle: int | None = None
+    direction: int | None = None
+    """+1 or -1, the sign of the motion that approached ``demand``."""
 
     @property
     def error(self) -> float:
         """Demand position minus actual position, signed."""
         return self.demand - self.actual
+
+    @property
+    def difference(self) -> float | None:
+        """Actual position minus the extra PV, signed, if there is one."""
+        return None if self.extra is None else self.actual - self.extra
 
 
 @dataclass(frozen=True)
@@ -105,6 +124,42 @@ class Statistics:
     error_on_mean: float
     minimum: float
     maximum: float
+
+
+@dataclass(frozen=True)
+class Extreme:
+    """The worst value of a repeatability figure, and the target it occurred at."""
+
+    value: float
+    position: float
+
+
+@dataclass(frozen=True)
+class Repeatability:
+    """Repeatability and accuracy of a deviation, in the style of ISO 230-2.
+
+    Readings are grouped by target position and approach direction, and each
+    group reduced to its mean and *sample* standard deviation ``s``. Then, at
+    the worst target:
+
+    - ``positive``/``negative`` are the unidirectional repeatabilities, 4s of
+      the approaches made moving in that direction;
+    - ``reversal`` is the positive approach's mean minus the negative's, the
+      hysteresis or backlash (signed, largest magnitude);
+    - ``bidirectional`` is ``max(2s+ + 2s- + |reversal|, 4s+, 4s-)``, the
+      spread expected at a target whichever way it is approached.
+
+    ``accuracy`` is the range from the lowest ``mean - 2s`` to the highest
+    ``mean + 2s`` over every target and direction.
+    """
+
+    cycles: int
+    positive: Extreme
+    negative: Extreme
+    reversal: Extreme
+    mean_reversal: float
+    bidirectional: Extreme
+    accuracy: float
 
 
 @dataclass(frozen=True)
@@ -120,6 +175,12 @@ class ScanSummary:
     error_magnitude: Statistics
     min_error: float
     max_error: float
+    difference: Statistics | None = None
+    """Signed actual minus extra PV, when comparing against the extra PV."""
+    error_repeatability: Repeatability | None = None
+    """Repeatability of the position error, when the scan was repeated."""
+    difference_repeatability: Repeatability | None = None
+    """Repeatability of actual minus extra PV, when comparing and repeated."""
 
 
 def summarise(values: Sequence[float]) -> Statistics:
@@ -141,14 +202,93 @@ def summarise(values: Sequence[float]) -> Statistics:
     )
 
 
-def summarise_scan(points: Sequence[ScanPoint]) -> ScanSummary:
-    """Reduce the recorded scan points to the reported statistics."""
+def _worst(values: dict[float, float]) -> Extreme:
+    """The entry of ``values`` with the largest magnitude."""
+    position = max(values, key=lambda target: abs(values[target]))
+    return Extreme(value=values[position], position=position)
+
+
+def group_deviations(
+    points: Sequence[ScanPoint], deviation: Callable[[ScanPoint], float | None]
+) -> dict[tuple[float, int], list[float]]:
+    """Group ``deviation`` by target position and approach direction.
+
+    Points without a direction, or without a deviation, are left out.
+    """
+    groups: dict[tuple[float, int], list[float]] = {}
+    for point in points:
+        value = deviation(point)
+        if point.direction is None or value is None:
+            continue
+        groups.setdefault((point.demand, point.direction), []).append(value)
+    return groups
+
+
+def repeatability(
+    points: Sequence[ScanPoint], deviation: Callable[[ScanPoint], float | None]
+) -> Repeatability | None:
+    """Work out the repeatability of ``deviation`` over a repeated scan.
+
+    Returns None unless every target was approached at least twice from each
+    direction, and some target from both, as a scan with ``repeats`` does.
+    """
+    groups = group_deviations(points, deviation)
+    if not groups or min(len(values) for values in groups.values()) < 2:
+        return None
+
+    means = {key: fmean(values) for key, values in groups.items()}
+    sds = {key: stdev(values, xbar=means[key]) for key, values in groups.items()}
+    positive = {target: 4 * sds[target, d] for target, d in groups if d == 1}
+    negative = {target: 4 * sds[target, d] for target, d in groups if d == -1}
+    both = positive.keys() & negative.keys()
+    if not both:
+        return None
+
+    reversal = {target: means[target, 1] - means[target, -1] for target in both}
+    bidirectional = {
+        target: max(
+            2 * sds[target, 1] + 2 * sds[target, -1] + abs(reversal[target]),
+            positive[target],
+            negative[target],
+        )
+        for target in both
+    }
+    return Repeatability(
+        cycles=min(len(values) for values in groups.values()),
+        positive=_worst(positive),
+        negative=_worst(negative),
+        reversal=_worst(reversal),
+        mean_reversal=fmean(reversal.values()),
+        bidirectional=_worst(bidirectional),
+        accuracy=max(means[key] + 2 * sds[key] for key in groups)
+        - min(means[key] - 2 * sds[key] for key in groups),
+    )
+
+
+def summarise_scan(points: Sequence[ScanPoint], compare: bool = False) -> ScanSummary:
+    """Reduce the recorded scan points to the reported statistics.
+
+    With ``compare``, the signed actual minus extra PV differences are
+    summarised too, so their mean is the calibration's offset and their SD its
+    scatter. If the scan was repeated in both directions, the repeatability of
+    the differences is added when comparing, and otherwise that of the
+    position error: when verifying a calibration, it's the device against the
+    readback that matters, not the stage against its demand.
+    """
     errors = [point.error for point in points]
+    differences = [point.difference for point in points if point.difference is not None]
     return ScanSummary(
         move_time=summarise([point.move_time for point in points]),
         error_magnitude=summarise([abs(error) for error in errors]),
         min_error=min(errors),
         max_error=max(errors),
+        difference=summarise(differences) if compare else None,
+        error_repeatability=(
+            None if compare else repeatability(points, lambda point: point.error)
+        ),
+        difference_repeatability=(
+            repeatability(points, lambda point: point.difference) if compare else None
+        ),
     )
 
 
@@ -159,24 +299,70 @@ def plan_scan(config: ScanConfig) -> tuple[int, float]:
     scan direction. Raises :class:`ValueError` if the request is impossible,
     rather than failing later with a division by zero.
     """
-    if config.step == 0:
-        raise ValueError("step must not be zero")
+    if config.compare and not config.extra_pv:
+        raise ValueError("comparing needs an extra PV to compare against")
     span = abs(config.stop - config.start)
     if span == 0:
         raise ValueError("start and stop must be different positions")
-    n_points = int(span / abs(config.step))
+    if config.step == 0:
+        raise ValueError("step must not be zero")
+    # Rounding, so that 0 to 0.3 in steps of 0.1 still reaches 0.3
+    steps = span / abs(config.step)
+    n_points = round(steps) if isclose(steps, round(steps)) else int(steps)
     if n_points == 0:
         raise ValueError(f"step ({config.step}) is larger than the scan range ({span})")
+    if config.repeats is not None:
+        if config.repeats < 2:
+            raise ValueError("a repeatability test needs at least 2 repeats")
+        if n_points < 2:
+            raise ValueError(
+                "a repeatability test needs at least 2 steps, so that some "
+                "target is approached from both directions"
+            )
     signed_step = abs(config.step) if config.stop >= config.start else -abs(config.step)
     return n_points, signed_step
+
+
+@dataclass(frozen=True)
+class Target:
+    """A position to move to, and where it sits in a repeated scan."""
+
+    demand: float
+    cycle: int | None = None
+    direction: int | None = None
+
+
+def plan_targets(config: ScanConfig) -> list[Target]:
+    """List the positions the scan visits, in order, after moving to the start.
+
+    A single pass visits every step after ``start``, up to ``stop``. With
+    ``repeats``, each cycle is that pass followed by the same steps back down
+    to ``start``, so that every target except the two ends is approached from
+    both directions.
+    """
+    n_points, signed_step = plan_scan(config)
+    positions = [config.start + (i * signed_step) for i in range(n_points + 1)]
+    if config.repeats is None:
+        return [Target(demand) for demand in positions[1:]]
+
+    outward = 1 if signed_step > 0 else -1
+    targets: list[Target] = []
+    for cycle in range(1, config.repeats + 1):
+        targets += [Target(demand, cycle, outward) for demand in positions[1:]]
+        targets += [
+            Target(demand, cycle, -outward) for demand in reversed(positions[:-1])
+        ]
+    return targets
 
 
 def scan_filename(config: ScanConfig, started: datetime.datetime) -> str:
     """Build the base name shared by the txt and png outputs."""
     date_text = started.strftime("%Y-%m-%d-%H:%M:%S")
+    prefix = "Verify" if config.compare else "Scan"
+    repeats = "" if config.repeats is None else f"_x{config.repeats}"
     return (
-        f"Scan_{config.motor}_{date_text}_"
-        f"{config.start}_{config.stop}_{abs(config.step)}"
+        f"{prefix}_{config.motor}_{date_text}_"
+        f"{config.start}_{config.stop}_{abs(config.step)}{repeats}"
     )
 
 
@@ -216,15 +402,13 @@ def move_to_start(config: ScanConfig) -> None:
     ca.caput(config.motor + PV_VAL, config.start, wait=True, timeout=TIMEOUT)
 
 
-def scan_steps(
-    config: ScanConfig, n_points: int, signed_step: float
-) -> Iterator[ScanPoint]:
-    """Step the motor through the scan, yielding a :class:`ScanPoint` per step."""
+def scan_steps(config: ScanConfig, targets: Sequence[Target]) -> Iterator[ScanPoint]:
+    """Step the motor through the targets, yielding a :class:`ScanPoint` for each."""
     import time
 
     ca = _catools()
-    for i in range(n_points):
-        demand = config.start + ((i + 1) * signed_step)
+    for target in targets:
+        demand = target.demand
 
         # Move a step, timing how long the motion takes to complete
         start_time = time.time()
@@ -257,6 +441,8 @@ def scan_steps(
             move_time=move_time,
             extra=None if extra is None else float(extra),
             timestamp=stamp,
+            cycle=target.cycle,
+            direction=target.direction,
         )
 
 
@@ -265,16 +451,24 @@ def headings(config: ScanConfig) -> list[str]:
     columns = [COLUMN_DESIRED, COLUMN_ACTUAL, COLUMN_MOVE_TIME]
     if config.extra_pv:
         columns.append(config.extra_pv)
+    if config.compare:
+        columns.append(COLUMN_DIFFERENCE)
+    if config.repeats is not None:
+        columns += [COLUMN_CYCLE, COLUMN_DIRECTION]
     if config.timestamp:
         columns.append(COLUMN_TIMESTAMP)
     return columns
 
 
-def row(point: ScanPoint) -> list[str]:
+def row(point: ScanPoint, compare: bool = False) -> list[str]:
     """One row of recorded data, in the same column order as :func:`headings`."""
     fields = [str(point.demand), str(point.actual), str(point.move_time)]
     if point.extra is not None:
         fields.append(str(point.extra))
+    if compare and point.difference is not None:
+        fields.append(str(point.difference))
+    if point.cycle is not None and point.direction is not None:
+        fields += [str(point.cycle), f"{point.direction:+d}"]
     if point.timestamp is not None:
         fields.append(point.timestamp)
     return fields
@@ -298,6 +492,8 @@ def print_summary(
     )
     print(f"  Date: {started.strftime('%Y-%m-%d-%H:%M:%S')}")
     print(f"  Number of points in the scan: {n_points}")
+    if config.repeats is not None:
+        print(f"  Repeated there and back {config.repeats} times")
     print(f"  UEIP:{info.ueip} VELO:{info.velo} ACCL:{info.accl}")
     print("**********************************************")
     print("Time taken for moves:")
@@ -305,16 +501,54 @@ def print_summary(
     print(f"  Standard Deviation: {move_time.sd}")
     print(f"  Min: {move_time.minimum} secs")
     print(f"  Max: {move_time.maximum} secs")
-    print("**********************************************")
-    print(
-        "Position error magnitude at the end of each move "
-        "(taking into account settling time delay)"
-    )
-    print(f"  Mean: {error.mean} +/- {error.error_on_mean}")
-    print(f"  Standard Deviation: {error.sd}")
-    print(f"  Min Pos Error: {summary.min_error}")
-    print(f"  Max Pos Error: {summary.max_error}")
+    if not config.compare:
+        print("**********************************************")
+        print(
+            "Position error magnitude at the end of each move "
+            "(taking into account settling time delay)"
+        )
+        print(f"  Mean: {error.mean} +/- {error.error_on_mean}")
+        print(f"  Standard Deviation: {error.sd}")
+        print(f"  Min Pos Error: {summary.min_error}")
+        print(f"  Max Pos Error: {summary.max_error}")
     print(f"  Delay: {config.delay} secs\n")
+    if summary.difference is not None:
+        difference = summary.difference
+        worst = max(abs(difference.minimum), abs(difference.maximum))
+        print("**********************************************")
+        print(f"Actual Position - {config.extra_pv} ({info.egu})")
+        print(f"  Mean (offset): {difference.mean} +/- {difference.error_on_mean}")
+        print(f"  Standard Deviation: {difference.sd}")
+        print(f"  Min: {difference.minimum}")
+        print(f"  Max: {difference.maximum}")
+        print(f"  Largest disagreement: {worst}\n")
+    if summary.error_repeatability is not None:
+        print_repeatability(
+            "Demand Position - Actual Position", info, summary.error_repeatability
+        )
+    if summary.difference_repeatability is not None:
+        print_repeatability(
+            f"Actual Position - {config.extra_pv}",
+            info,
+            summary.difference_repeatability,
+        )
+
+
+def print_repeatability(label: str, info: MotorInfo, figures: Repeatability) -> None:
+    """Print the repeatability block for one kind of deviation."""
+
+    def at(extreme: Extreme) -> str:
+        return f"{extreme.value} at {extreme.position}"
+
+    print("**********************************************")
+    print(f"Repeatability of {label} ({info.egu})")
+    print(f"  over {figures.cycles} bidirectional cycles, worst target shown")
+    print(f"  Unidirectional repeatability R+ (4 SD): {at(figures.positive)}")
+    print(f"  Unidirectional repeatability R- (4 SD): {at(figures.negative)}")
+    print(f"  Reversal B (mean + minus mean -): {at(figures.reversal)}")
+    print(f"  Mean reversal: {figures.mean_reversal}")
+    print(f"  Bidirectional repeatability R: {at(figures.bidirectional)}")
+    print(f"  Bidirectional accuracy A: {figures.accuracy}\n")
 
 
 def _padded(low: float, high: float) -> tuple[float, float]:
@@ -360,20 +594,25 @@ def build_figure(
 ) -> Any:
     """Build the multi-panel figure of position error and move time.
 
-    Whichever backend the caller has selected is used as-is.
+    A verify scan gets :func:`build_verify_figure` instead. Whichever backend
+    the caller has selected is used as-is.
     """
     import matplotlib.pyplot as plt
+
+    if config.compare:
+        return build_verify_figure(config, info, points, started, summary)
 
     errors = [point.error for point in points]
     move_times = [point.move_time for point in points]
 
-    n_rows = 3 if config.extra_pv else 2
+    n_rows = 2 + bool(config.extra_pv)
     fig, axes = plt.subplots(n_rows, 1, figsize=(8.27, 11.69))
     # matplotlib annotates suptitle's **kwargs as Unknown, which strict mode flags
     fig.suptitle(  # pyright: ignore[reportUnknownMemberType]
         f"Step Scanning {config.motor}\n"
         f"Start={config.start} Stop={config.stop} "
-        f"Step={abs(config.step)} Delay={config.delay}\n"
+        f"Step={abs(config.step)} Delay={config.delay}"
+        f"{'' if config.repeats is None else f' Repeats={config.repeats}'}\n"
         f"{started.strftime('%Y-%m-%d-%H:%M:%S')}\n"
         f" UEIP:{info.ueip} VELO:{info.velo} ACCL:{info.accl}",
         fontsize=14,
@@ -417,7 +656,14 @@ def build_figure(
         actuals = [point.actual for point in points]
         extras = [point.extra for point in points if point.extra is not None]
         extra_axes = axes[2]
-        extra_axes.plot(actuals, extras, color="b")
+        # A repeated scan retraces itself, so plot points rather than a line
+        extra_axes.plot(
+            actuals,
+            extras,
+            color="b",
+            marker="." if config.repeats else None,
+            linestyle="none" if config.repeats else "-",
+        )
         extra_axes.set_ylim(*_padded(min(extras), max(extras)))
         extra_axes.set_xlim(*_padded(min(actuals), max(actuals)))
         extra_axes.set_ylabel(config.extra_pv)
@@ -426,12 +672,186 @@ def build_figure(
     return fig
 
 
+DIRECTIONS = ((1, "tab:green", "moving +"), (-1, "tab:purple", "moving -"))
+"""Approach direction, the colour it is drawn in, and its legend label."""
+
+
+def build_verify_figure(
+    config: ScanConfig,
+    info: MotorInfo,
+    points: Sequence[ScanPoint],
+    started: datetime.datetime,
+    summary: ScanSummary,
+) -> Any:
+    """Build the figure for a verify scan: the extra PV against the readback.
+
+    The stage's positioning against its demand is left out, as it says nothing
+    about the calibration. A single pass shows the extra PV and the difference
+    against the readback. A repeated scan shows the difference as mean and 2s
+    per target and direction, each reading's scatter about its mean, and the
+    repeatability figures at every target.
+    """
+    import matplotlib.pyplot as plt
+
+    compared = [point for point in points if point.difference is not None]
+    n_rows = 2 if config.repeats is None else 3
+    fig, axes = plt.subplots(n_rows, 1, figsize=(8.27, 11.69))
+    # matplotlib annotates suptitle's **kwargs as Unknown, which strict mode flags
+    fig.suptitle(  # pyright: ignore[reportUnknownMemberType]
+        f"Verifying {config.extra_pv}\nagainst {config.motor}{PV_RBV}\n"
+        f"Start={config.start} Stop={config.stop} "
+        f"Step={abs(config.step)} Delay={config.delay}"
+        f"{'' if config.repeats is None else f' Repeats={config.repeats}'}\n"
+        f"{started.strftime('%Y-%m-%d-%H:%M:%S')}",
+        fontsize=12,
+    )
+    difference_label = f"{PV_RBV[1:]} - {config.extra_pv}\n({info.egu})"
+
+    if config.repeats is None:
+        actuals = [point.actual for point in compared]
+        extras = [point.extra for point in compared]
+        extra_axes = axes[0]
+        extra_axes.plot(actuals, extras, color="b", marker=".")
+        extra_axes.set_ylabel(f"{config.extra_pv} ({info.egu})")
+        extra_axes.set_xlabel(f"{config.motor}{PV_RBV} ({info.egu})")
+
+        difference_axes = axes[1]
+        differences = [point.difference for point in compared]
+        difference_axes.plot(actuals, differences, color="g", marker=".")
+        difference_axes.axhline(0, linestyle="--", color="black")
+        difference_axes.set_ylabel(difference_label)
+        difference_axes.set_xlabel(f"{config.motor}{PV_RBV} ({info.egu})")
+        if summary.difference is not None:
+            difference = summary.difference
+            difference_axes.text(
+                0.02,
+                0.95,
+                f"Mean={difference.mean:.4g} SD={difference.sd:.4g}",
+                transform=difference_axes.transAxes,
+                verticalalignment="top",
+            )
+        fig.tight_layout()
+        return fig
+
+    groups = group_deviations(compared, lambda point: point.difference)
+    means = {key: fmean(values) for key, values in groups.items()}
+    sds = {
+        key: stdev(values) if len(values) > 1 else 0.0 for key, values in groups.items()
+    }
+    # Offset the two directions a little, so their error bars don't overlap
+    nudge = abs(config.step) / 10
+    figures = summary.difference_repeatability
+
+    # The calibration's systematic error, with each direction's 2s spread
+    mean_axes = axes[0]
+    for direction, colour, label in DIRECTIONS:
+        targets = sorted(target for target, d in groups if d == direction)
+        mean_axes.errorbar(
+            [target + direction * nudge for target in targets],
+            [means[target, direction] for target in targets],
+            yerr=[2 * sds[target, direction] for target in targets],
+            color=colour,
+            marker=".",
+            capsize=2,
+            label=f"{label}, mean +/- 2s",
+        )
+    if figures is not None:
+        low = min(means[key] - 2 * sds[key] for key in groups)
+        mean_axes.axhspan(
+            low,
+            low + figures.accuracy,
+            color="grey",
+            alpha=0.15,
+            label=f"A = {figures.accuracy:.4g}",
+        )
+    mean_axes.axhline(0, linestyle="--", color="black")
+    mean_axes.set_ylabel(difference_label)
+    mean_axes.set_xlabel(f"Target position ({info.egu})")
+    mean_axes.legend(loc="lower right", fontsize="small")
+
+    # Every reading about the mean of its target and direction: the spread
+    # here is the repeatability, and a trend from cycle to cycle is drift
+    scatter_axes = axes[1]
+    cmap = plt.get_cmap("viridis")
+    cycles = sorted({point.cycle for point in compared if point.cycle is not None})
+    for index, cycle in enumerate(cycles):
+        for direction, _, _ in DIRECTIONS:
+            chosen = [
+                point
+                for point in compared
+                if point.cycle == cycle and point.direction == direction
+            ]
+            scatter_axes.plot(
+                [point.demand + direction * nudge for point in chosen],
+                [
+                    point.difference - means[point.demand, direction]
+                    for point in chosen
+                    if point.difference is not None
+                ],
+                color=cmap(index / max(len(cycles) - 1, 1)),
+                marker="^" if direction > 0 else "v",
+                linestyle="none",
+                label=f"cycle {cycle}" if direction > 0 else None,
+            )
+    scatter_axes.axhline(0, linestyle="--", color="black")
+    scatter_axes.set_ylabel(f"Scatter about the mean\n({info.egu})")
+    scatter_axes.set_xlabel(
+        f"Target position ({info.egu}), \u25b2 moving +, \u25bc moving -"
+    )
+    scatter_axes.legend(loc="lower right", fontsize="small", ncols=len(cycles))
+
+    # The repeatability figures at every target, whose worst are printed
+    figure_axes = axes[2]
+    both = sorted(target for target, d in groups if d == 1 and (target, -1) in groups)
+    for direction, colour, label in DIRECTIONS:
+        targets = sorted(target for target, d in groups if d == direction)
+        figure_axes.plot(
+            targets,
+            [4 * sds[target, direction] for target in targets],
+            color=colour,
+            marker=".",
+            label=f"R{'+' if direction > 0 else '-'} (4s {label})",
+        )
+    figure_axes.plot(
+        both,
+        [abs(means[target, 1] - means[target, -1]) for target in both],
+        color="tab:orange",
+        marker=".",
+        label="|B| reversal",
+    )
+    figure_axes.plot(
+        both,
+        [
+            max(
+                2 * sds[target, 1]
+                + 2 * sds[target, -1]
+                + abs(means[target, 1] - means[target, -1]),
+                4 * sds[target, 1],
+                4 * sds[target, -1],
+            )
+            for target in both
+        ],
+        color="black",
+        marker=".",
+        label="R bidirectional",
+    )
+    figure_axes.set_ylim(bottom=0)
+    figure_axes.set_ylabel(f"Repeatability ({info.egu})")
+    figure_axes.set_xlabel(f"Target position ({info.egu})")
+    figure_axes.legend(loc="upper right", fontsize="small", ncols=2)
+
+    fig.tight_layout()
+    return fig
+
+
 def perform_scan(config: ScanConfig) -> list[ScanPoint]:
     """Run a complete scan, writing and plotting whichever outputs are enabled.
 
     Returns the recorded points so that callers can do their own analysis.
     """
-    n_points, signed_step = plan_scan(config)
+    _, signed_step = plan_scan(config)
+    targets = plan_targets(config)
+    n_points = len(targets)
 
     print("Motor step scanning...")
     print(
@@ -456,14 +876,14 @@ def perform_scan(config: ScanConfig) -> list[ScanPoint]:
         print(heading)
         if txt is not None:
             txt.write(f"{heading}\n")
-        for point in scan_steps(config, n_points, signed_step):
-            line = " ".join(row(point))
+        for point in scan_steps(config, targets):
+            line = " ".join(row(point, config.compare))
             print(line)
             if txt is not None:
                 txt.write(f"{line}\n")
             points.append(point)
 
-    summary = summarise_scan(points)
+    summary = summarise_scan(points, config.compare)
     print_summary(config, info, signed_step, n_points, started, summary)
 
     # The png is written first, under Agg, so that it survives even if setting
