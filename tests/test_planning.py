@@ -91,3 +91,16 @@ def test_plan_rejects_an_impossible_scan():
 )
 def test_format_duration(seconds: float, text: str):
     assert format_duration(seconds) == text
+
+
+def test_path_until_follows_the_readings_taken():
+    profile = MotionProfile(velocity=1.0, acceleration_time=0.0, overhead=1.0)
+    plan = plan_scan_timeline(verify(), profile, position=-1.0)
+
+    # None yet: still where it started, on the way to the start
+    assert plan.path_until(0) == [(0.0, -1.0)]
+    # Each reading ends the path at the time and place it was taken
+    for taken, reading in enumerate(plan.readings, start=1):
+        assert plan.path_until(taken)[-1] == reading
+    assert plan.path_until(len(plan.readings)) == plan.path
+    assert plan.path_until(len(plan.readings) + 5) == plan.path

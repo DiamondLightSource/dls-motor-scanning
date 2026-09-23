@@ -69,3 +69,7 @@ lockfiles/
 
 # ruff cache
 .ruff_cache/
+
+# Files generated from tool
+Scan_*
+Verify_*

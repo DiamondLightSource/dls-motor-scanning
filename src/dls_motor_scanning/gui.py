@@ -141,6 +141,10 @@ class VerifyWindow(QtWidgets.QMainWindow):
         self.pending = ""
         self.errors: list[str] = []
         self.scan_plan: Plan | None = None
+        # What _mark_progress moves along the plan while a scan runs
+        self.plan_axes: Any = None
+        self.plan_done: Any = None
+        self.plan_now: Any = None
         self.began = self.last_draw = 0.0
         # What the result tabs are showing: a run in progress or an opened file
         self.shown_config: ScanConfig | None = None
@@ -403,6 +407,11 @@ class VerifyWindow(QtWidgets.QMainWindow):
         figure = self.plan_canvas.figure
         figure.clear()
         axes: Any = figure.subplots()
+        self.plan_axes = axes
+        self.plan_done = self.plan_now = None
+        # While a scan runs, show the plan it is following
+        if self.running and self.scan_plan is not None:
+            self.plan = self.scan_plan
         if self.plan is not None:
             times = [seconds / 60 for seconds, _ in self.plan.path]
             positions = [position for _, position in self.plan.path]
@@ -420,10 +429,19 @@ class VerifyWindow(QtWidgets.QMainWindow):
             if state and state.has_limits:
                 for limit in (state.low_limit, state.high_limit):
                     axes.axhline(limit, color="#c0392b", linestyle="--", linewidth=1)
-            axes.legend(loc="upper right")
             axes.set_title(
                 f"{self.plan.moves} moves, about {format_duration(self.plan.duration)}"
             )
+            if self.running:
+                # Where the scan has got to, drawn over the plan
+                (self.plan_done,) = axes.plot(
+                    [], [], color="tab:green", linewidth=3, label="done"
+                )
+                (self.plan_now,) = axes.plot(
+                    [], [], color="tab:red", marker="o", markersize=10, zorder=5
+                )
+                self._mark_progress(len(self.output.points))
+            axes.legend(loc="upper right")
         axes.set_xlabel("Time from start (min)")
         axes.set_ylabel(f"Position ({self._egu()})")
         axes.grid(True, alpha=0.3)
@@ -588,6 +606,7 @@ class VerifyWindow(QtWidgets.QMainWindow):
         self.stop_requested = False
         self.scanner = process
         self._set_running(True)
+        self.tabs.setCurrentIndex(0)
         print(f"Running: {' '.join(process.arguments())}", flush=True)
         process.start()
 
@@ -609,6 +628,7 @@ class VerifyWindow(QtWidgets.QMainWindow):
         if point is not None and self.shown_config is not None:
             self._add_table_row(self.shown_config, point)
             self._show_progress(len(self.output.points) - 1)
+            self._mark_progress(len(self.output.points))
 
     def _scan_errors(self) -> None:
         if self.scanner is None:
@@ -621,6 +641,25 @@ class VerifyWindow(QtWidgets.QMainWindow):
         if error == QtCore.QProcess.ProcessError.FailedToStart:
             self.errors.append(f"Could not start {sys.executable}")
             self._scan_finished(-1, QtCore.QProcess.ExitStatus.CrashExit)
+
+    def _mark_progress(self, readings: int) -> None:
+        """Move the progress drawn on the plan on to the latest reading."""
+        plan = self.scan_plan
+        if plan is None or self.plan_done is None or self.plan_now is None:
+            return
+        done = plan.path_until(readings)
+        self.plan_done.set_data(
+            [seconds / 60 for seconds, _ in done], [position for _, position in done]
+        )
+        seconds, position = done[-1]
+        self.plan_now.set_data([seconds / 60], [position])
+        if self.plan_axes is not None:
+            self.plan_axes.set_title(
+                f"Reading {readings} of {len(plan.readings)}"
+                if readings
+                else f"Moving to the start, {position:g}"
+            )
+        self.plan_canvas.draw_idle()
 
     def _show_progress(self, index: int) -> None:
         """Count the readings, and re-estimate what's left from the pace so far."""

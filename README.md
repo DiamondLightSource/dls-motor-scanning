@@ -233,8 +233,9 @@ This opens a window for the `verify` scan. It needs a display and PyQt5.
    a range outside the soft limits, or a step that doesn't divide the range.
 3. Press **Run** and confirm. This runs the `verify` command above in a
    separate process, in the output folder, and follows what it prints. Its
-   output is echoed to the terminal too. The **Data** tab fills in with every
-   reading. The **Results** tab redraws every 10 seconds, and the progress bar
+   output is echoed to the terminal too. The **Plan** tab shows how far it
+   has got: the path done so far in green, a red dot at the latest reading
+   and "Reading N of M" above. The **Data** tab fills in with every reading. The **Results** tab redraws every 10 seconds, and the progress bar
    re-estimates the time left from the pace so far. **Stop** ends the scan
    and keeps every reading so far. The motor still finishes the move it was
    given.

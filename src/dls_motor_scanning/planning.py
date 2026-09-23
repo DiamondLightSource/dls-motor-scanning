@@ -79,6 +79,17 @@ class Plan:
         """Seconds from starting the scan to its last reading."""
         return self.path[-1][0]
 
+    def path_until(self, readings: int) -> list[tuple[float, float]]:
+        """The part of :attr:`path` done once ``readings`` have been taken.
+
+        With none taken, the motor is still on its way to the start. After
+        that, the path has two vertices per reading, arriving and then waiting
+        out the delay, following the start and the move to it.
+        """
+        if readings <= 0:
+            return self.path[:1]
+        return self.path[: 2 + 2 * min(readings, len(self.readings))]
+
 
 def plan_scan_timeline(
     config: ScanConfig, profile: MotionProfile, position: float | None = None
