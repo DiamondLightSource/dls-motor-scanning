@@ -7,7 +7,7 @@ to end without one.
 
 import sys
 import types
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
@@ -26,6 +26,8 @@ class FakeCatools:
 
     def __init__(self, following_error: float = 0.001) -> None:
         self.following_error = following_error
+        # PVs whose value follows the true motor position, such as a pot
+        self.signals: dict[str, Callable[[float], float]] = {}
         self.position = 0.0
         self.clock = 1786000000.0
         self.puts: list[tuple[str, Any]] = []
@@ -45,6 +47,8 @@ class FakeCatools:
             return 15.0
         if pv.endswith(".ACCL"):
             return 0.5
+        if pv in self.signals:
+            return self.signals[pv](self.position)
         return 42.0
 
     def caget(self, pvs: str | list[str], format: int = 0, **kwargs: Any) -> Any:  # noqa: A002

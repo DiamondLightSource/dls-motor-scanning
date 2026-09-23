@@ -127,21 +127,46 @@ def scan(
 
 @app.command()
 def calibrate(
-    csv_path: Annotated[
+    data_path: Annotated[
         Path,
         typer.Argument(
             exists=True,
             dir_okay=False,
             readable=True,
-            help="CSV file of paired raw feedback and scaled position readings.",
+            help=(
+                "Scan data file written with --extra-pv, or a CSV of paired raw "
+                "feedback and scaled position readings."
+            ),
         ),
     ],
-    raw_input_pv: Annotated[
-        str,
+    raw_column: Annotated[
+        str | None,
         typer.Option(
-            "--raw-input-pv", metavar="PV", help="Raw input PV read by the calc record."
+            "--raw-column",
+            metavar="COLUMN",
+            help="Column holding the raw feedback. Defaults to a scan's extra PV.",
         ),
-    ] = "inputPV",
+    ] = None,
+    position_column: Annotated[
+        str | None,
+        typer.Option(
+            "--position-column",
+            metavar="COLUMN",
+            help="Column holding the scaled position. Defaults to a scan's Actual.",
+        ),
+    ] = None,
+    raw_input_pv: Annotated[
+        str | None,
+        typer.Option(
+            "--raw-input-pv",
+            metavar="PV",
+            help="Raw input PV read by the calc record. Defaults to the raw column.",
+        ),
+    ] = None,
+    egu: Annotated[
+        str,
+        typer.Option("--egu", metavar="UNITS", help="EGU of the calc record."),
+    ] = "mm",
     excel_cell: Annotated[
         str,
         typer.Option(
@@ -153,23 +178,36 @@ def calibrate(
 ) -> None:
     """Fit a 5th order polynomial converting raw feedback into EGUs.
 
-    For example, converting a potentiometer from raw ADC bits to EGUs. The CSV
-    should hold one integer column of unscaled positions and one float column of
-    scaled positions. An EPICS calc record and an equivalent Excel formula are
-    printed.
+    For example, converting a potentiometer from raw ADC counts to EGUs. Given
+    the data file from a scan run with --extra-pv, the extra PV is fitted
+    against the Actual position with no further options. An EPICS calc record
+    and an equivalent Excel formula are printed.
     """
-    from .calibration import calc_record, excel_formula, fit_calibration
+    from .calibration import (
+        calc_record,
+        excel_formula,
+        fit_readings,
+        load_readings,
+        max_residual,
+    )
 
     try:
-        calibration = fit_calibration(csv_path)
+        readings = load_readings(data_path, raw_column, position_column)
+        calibration = fit_readings(readings)
     except ValueError as error:
         raise typer.BadParameter(str(error)) from error
+
+    worst = max_residual(calibration, readings)
+    print(
+        f"Fitted {readings.position_column} against {readings.raw_column} "
+        f"over {len(readings.raw)} readings, max residual {worst:.3e} {egu}\n"
+    )
 
     for name, coefficient in zip("BCDEFG", calibration.ascending, strict=True):
         print(f"{name} = {coefficient:.10e}")
 
     print("\nEPICS calc record:")
-    print(calc_record(calibration, raw_input_pv))
+    print(calc_record(calibration, raw_input_pv or readings.raw_column, egu))
 
     print("\nExcel formula:")
     print(excel_formula(calibration, excel_cell))

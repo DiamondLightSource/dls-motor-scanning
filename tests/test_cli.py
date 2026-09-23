@@ -66,8 +66,14 @@ def test_scan_help_documents_the_options():
 
 def test_calibrate_help_documents_the_options():
     help_text = run("calibrate", "--help")
-    assert "--raw-input-pv" in help_text
-    assert "--excel-cell" in help_text
+    for option in (
+        "--raw-column",
+        "--position-column",
+        "--raw-input-pv",
+        "--egu",
+        "--excel-cell",
+    ):
+        assert option in help_text
 
 
 def test_no_arguments_shows_help_rather_than_failing():
@@ -133,3 +139,39 @@ def test_calibrate_command_prints_a_calc_record(
     assert "<records.calc" in result.output
     assert 'INPA="BL01I-MO-POT-01:ADC"' in result.output
     assert "POWER(A1,5)" in result.output
+
+
+def test_calibrate_command_reads_a_scan_file_directly(
+    fake_ca: FakeCatools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """scan --extra-pv then calibrate on its data file, with no reformatting."""
+    monkeypatch.chdir(tmp_path)
+    pot = "SIM-MO-POT-01:RAW"
+    fake_ca.signals[pot] = lambda position: 100.0 + 200.0 * position
+    scanned = CliRunner().invoke(
+        app,
+        ["scan", "SIM-MO-TEST-01:Y", "0", "10", "1", "0", "--extra-pv", pot]
+        + ["--timestamp", "--no-png", "--no-plot"],
+    )
+    assert scanned.exit_code == 0, scanned.output
+    data_file = next(tmp_path.glob("Scan_*.txt"))
+
+    result = CliRunner().invoke(app, ["calibrate", str(data_file), "--egu", "deg"])
+
+    assert result.exit_code == 0, result.output
+    assert f"Fitted Actual against {pot} over 10 readings" in result.output
+    assert f'INPA="{pot}"' in result.output
+    assert 'EGU="deg"' in result.output
+
+
+def test_calibrate_command_reports_a_missing_column(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.chdir(tmp_path)
+    csv = tmp_path / "pot.csv"
+    csv.write_text("raw,encoder\n" + "".join(f"{r},{r}.5\n" for r in range(10)))
+
+    result = CliRunner().invoke(app, ["calibrate", str(csv), "--raw-column", "adc"])
+
+    assert result.exit_code != 0
+    assert "No column named 'adc'" in result.output

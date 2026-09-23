@@ -40,6 +40,16 @@ PV_UEIP = ".UEIP"
 PV_VELO = ".VELO"
 PV_ACCL = ".ACCL"
 
+COLUMN_DESIRED = "Desired"
+COLUMN_ACTUAL = "Actual"
+COLUMN_MOVE_TIME = "MoveTime"
+COLUMN_TIMESTAMP = "Timestamp(UTC)"
+"""Column headings of the data file.
+
+The extra PV, when there is one, is headed with its own name. The calibrate
+command reads these files back, so it relies on the names here.
+"""
+
 
 @dataclass(frozen=True)
 class ScanConfig:
@@ -252,11 +262,11 @@ def scan_steps(
 
 def headings(config: ScanConfig) -> list[str]:
     """Column headings for the recorded data."""
-    columns = ["Desired", "Actual", "MoveTime"]
+    columns = [COLUMN_DESIRED, COLUMN_ACTUAL, COLUMN_MOVE_TIME]
     if config.extra_pv:
         columns.append(config.extra_pv)
     if config.timestamp:
-        columns.append("Timestamp(UTC)")
+        columns.append(COLUMN_TIMESTAMP)
     return columns
 
 

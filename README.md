@@ -98,11 +98,25 @@ which skips the interactive window entirely and just writes the png.
 ## Calibrating a feedback device
 
 ```
-dls-motor-scanning calibrate CSV_PATH [options]
+dls-motor-scanning calibrate DATA_PATH [options]
 ```
 
-The CSV needs one integer column, taken as the raw feedback, and one float
-column, taken as the scaled position to calibrate against:
+The usual input is the data file from a scan run with `--extra-pv` reading the
+raw feedback, such as a potentiometer's ADC counts, at every step:
+
+```
+dls-motor-scanning scan BL01I-MO-STAGE-01:X 0 50 1 0.5 --extra-pv BL01I-MO-POT-01:ADC --no-plot
+dls-motor-scanning calibrate Scan_BL01I-MO-STAGE-01:X_<date>_0.0_50.0_1.0.txt --egu mm
+```
+
+The extra PV column is fitted against the `Actual` column, and the calc
+record's `INPA` defaults to the extra PV's name, so no other options are
+needed. The fit needs at least six distinct raw readings, and many more across
+the full travel give a better one.
+
+A comma separated CSV works too. With exactly two columns, the raw feedback is
+the integer column if just one of them holds integers, otherwise the first
+column:
 
 ```
 raw,encoder
@@ -115,9 +129,18 @@ raw,encoder
 dls-motor-scanning calibrate pot.csv --raw-input-pv BL01I-MO-POT-01:ADC --excel-cell C2
 ```
 
-This prints the six coefficients, a Builder `records.calc` entry with them
-loaded into fields B to G, and an equivalent Excel formula referencing
-`--excel-cell`.
+Option                     | Effect
+:---                       | :---
+`--raw-column COLUMN`      | Column holding the raw feedback, instead of the default above
+`--position-column COLUMN` | Column holding the scaled position, instead of `Actual`
+`--raw-input-pv PV`        | `INPA` of the calc record (default: the raw column's name)
+`--egu UNITS`              | `EGU` of the calc record (default `mm`)
+`--excel-cell CELL`        | Cell the Excel formula reads the raw value from (default `A1`)
+
+This prints the largest residual of the fit, the six coefficients, a Builder
+`records.calc` entry with them loaded into fields B to G, and an equivalent
+Excel formula referencing `--excel-cell`. The record's `name` and `record` are
+left blank for you to fill in.
 
 ## Development
 
