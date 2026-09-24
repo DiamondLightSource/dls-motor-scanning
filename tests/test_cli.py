@@ -214,7 +214,7 @@ def test_characterise_feedback_command_needs_a_compare_pv():
         app, ["characterise-feedback", "SIM-MO-TEST-01:Y", "0", "2"]
     )
     assert result.exit_code != 0
-    assert "--compare-pv" in result.output
+    assert "--compare-pv" in ANSI_ESCAPE.sub("", result.output)
 
 
 def test_characterise_feedback_help_documents_the_options():
@@ -309,7 +309,7 @@ def test_characterise_feedback_command_rejects_a_single_repeat():
         + ["--compare-pv", "SIM-MO-POT-01:POS"],
     )
     assert result.exit_code != 0
-    assert "--repeats" in result.output
+    assert "--repeats" in ANSI_ESCAPE.sub("", result.output)
 
 
 def test_motor_info_prints_the_motor_fields_as_json(fake_ca: FakeCatools):
