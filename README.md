@@ -15,10 +15,10 @@ Four commands are provided:
 - `calibrate` fits a 5th order polynomial that converts an unscaled feedback
   device, such as a potentiometer read as raw ADC counts, into engineering
   units, and emits it as an EPICS calc record and an Excel formula.
-- `verify` scans a motor like `scan`, and reports how far another PV, such as
+- `characterise-feedback` scans a motor like `scan`, and reports how far another PV, such as
   the calibrated calc record, is from the motor readback at every step, and
   optionally the unidirectional and bidirectional repeatability.
-- `gui` opens a window that plans, runs and views `verify` scans.
+- `gui` plans, runs and views scans, automatic calibration and feedback characterisation.
 
 What            | Where
 :---:           | :---:
@@ -146,10 +146,10 @@ This prints the largest residual of the fit, the six coefficients, a Builder
 Excel formula referencing `--excel-cell`. The record's `name` and `record` are
 left blank for you to fill in.
 
-## Verifying a calibration
+## Characterising feedback
 
 ```
-dls-motor-scanning verify MOTOR START STOP --compare-pv PV [options]
+dls-motor-scanning characterise-feedback MOTOR START STOP --compare-pv PV [options]
 ```
 
 Once the calc record is loaded, give the full range of the stage and the
@@ -157,7 +157,7 @@ calibrated PV. The motor readback, ideally from a trusted encoder, is the
 reference:
 
 ```
-dls-motor-scanning verify BL01I-MO-STAGE-01:X 0 50 --compare-pv BL01I-MO-POT-01:POS --no-plot
+dls-motor-scanning characterise-feedback BL01I-MO-STAGE-01:X 0 50 --compare-pv BL01I-MO-POT-01:POS --no-plot
 ```
 
 By default this is a single pass from `START` to `STOP` in 20 steps, with a
@@ -176,7 +176,7 @@ there and back `N` times, so that each target between the two ends is approached
 `N` times moving each way:
 
 ```
-dls-motor-scanning verify BL01I-MO-STAGE-01:X 0 50 --compare-pv BL01I-MO-POT-01:POS --repeats 5 --no-plot
+dls-motor-scanning characterise-feedback BL01I-MO-STAGE-01:X 0 50 --compare-pv BL01I-MO-POT-01:POS --repeats 5 --no-plot
 ```
 
 The readings at each target are grouped by approach direction and reduced to a
@@ -193,7 +193,7 @@ Bidirectional accuracy A           | Lowest `mean - 2s` to highest `mean + 2s`, 
 
 These are for `Actual - PV`, the calibrated device against the readback. The
 data file gains `Cycle` and `Direction` (`+1` or `-1`) columns, and the outputs
-are named `Verify_..._x<N>`. The plot has three panels:
+are named `CharacteriseFeedback_..._x<N>`. The plot has three panels:
 
 - `RBV - PV` at each target, as mean and `2s` for each direction, over the band
   of A. The shape is the calibration's systematic error, the gap between the
@@ -216,13 +216,37 @@ If `--step` doesn't divide the range exactly, the last target falls short of
 as a leadscrew's pitch, because every target then lands at the same phase and
 the error doesn't show.
 
-## The verify GUI
+## The scan and characterise-feedback GUI
 
 ```
 dls-motor-scanning gui
 ```
 
-This opens a window for the `verify` scan. It needs a display and PyQt5.
+This opens a window with **Scan** and **Characterise feedback** tabs. It needs a display and
+PyQt5. In Scan, supplying an **Extra PV** automatically fits that raw feedback
+against the measured motor readback after a successful scan. The embedded
+**Calibration** page shows the fit, residuals, coefficients, EPICS calc record
+and Excel formula. It also accepts existing scan files or CSVs. The EGU field
+can be edited for files whose units are not recorded.
+
+The CLI does the same with `scan --extra-pv PV`: calibration is printed and,
+when text output is enabled, saved as `Calibration_Scan_...txt`. At least six
+distinct finite raw readings are needed; otherwise calibration is skipped with
+an explanation and the scan data is retained. Characterise feedback does not recalibrate its
+comparison PV. The standalone `calibrate` command remains available for files.
+Generated formulas are never applied to the IOC automatically.
+
+The window grows to fit the parameter form, up to the available screen height;
+smaller screens retain scrolling. **Appearance > System** follows the desktop
+colour preference (the Linux Settings portal, with GNOME settings as a fallback).
+Widgets and plots share the resulting light/dark palette. **Light** and **Dark**
+are also available for remote sessions where desktop preferences are unavailable.
+Your appearance selection is remembered.
+
+The former `verify` command remains a hidden compatibility alias. New feedback
+files use `CharacteriseFeedback_...`; existing `Verify_...` files still open.
+
+For feedback characterisation:
 
 1. Enter the motor PV and press **Read motor**. This reads the position, soft
    limits, EGU, VELO and ACCL. The compare PV defaults to `<motor>:POT`.
@@ -231,19 +255,22 @@ This opens a window for the `verify` scan. It needs a display and PyQt5.
    will follow, with a dot at each reading. The number of moves, the estimated
    time and the finishing time are shown under the form. So are warnings about
    a range outside the soft limits, or a step that doesn't divide the range.
-3. Press **Run** and confirm. This runs the `verify` command above in a
-   separate process, in the output folder, and follows what it prints. Its
+3. Press **Run** and confirm. This runs the `characterise-feedback` command above in a
+   separate process and follows what it prints. Its
    output is echoed to the terminal too. The **Plan** tab shows how far it
    has got: the path done so far in green, a red dot at the latest reading
    and "Reading N of M" above. The **Data** tab fills in with every reading. The **Results** tab redraws every 10 seconds, and the progress bar
    re-estimates the time left from the pace so far. **Stop** ends the scan
    and keeps every reading so far. The motor still finishes the move it was
    given.
-4. At the end, `verify` writes its usual `Verify_...` txt and png to the
-   output folder, and its summary appears in the **Summary** tab. A stopped
-   scan has its txt but no png. The Results tab's toolbar can save the plot.
+4. Review the results, then use **Save data...** to choose a filename and
+   save the readings. GUI scans do not automatically write data, PNGs or
+   calibration reports. Stopped scans can also be reviewed and saved.
+   Use each plot's toolbar to save an image. Readings are held in memory until
+   replaced by another scan/file or the window is closed. CLI saving defaults
+   are unchanged.
 
-**Open data file...** loads any earlier `Verify_*.txt` into the Results,
+**Open data file...** loads any earlier `CharacteriseFeedback_*.txt` into the Results,
 Summary and Data tabs. It fills in the form too, so the same scan can be run
 again. Each plot has a toolbar to zoom, pan and save.
 

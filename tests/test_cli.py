@@ -47,7 +47,7 @@ def test_cli_version():
 def test_help_lists_every_command():
     help_text = run("--help")
     assert "scan" in help_text
-    assert "verify" in help_text
+    assert "characterise-feedback" in help_text
     assert "calibrate" in help_text
     assert "gui" in help_text
 
@@ -180,14 +180,23 @@ def test_calibrate_command_reports_a_missing_column(
     assert "No column named 'adc'" in result.output
 
 
-def test_verify_command_reports_the_readback_minus_the_pv(
+def test_characterise_feedback_command_reports_the_readback_minus_the_pv(
     fake_ca: FakeCatools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     monkeypatch.chdir(tmp_path)
     fake_ca.signals["SIM-MO-POT-01:POS"] = lambda position: position + 0.01
     result = CliRunner().invoke(
         app,
-        ["verify", "SIM-MO-TEST-01:Y", "0", "2", "--step", "0.5", "--delay", "0"]
+        [
+            "characterise-feedback",
+            "SIM-MO-TEST-01:Y",
+            "0",
+            "2",
+            "--step",
+            "0.5",
+            "--delay",
+            "0",
+        ]
         + ["--compare-pv", "SIM-MO-POT-01:POS", "--no-plot"],
     )
 
@@ -196,18 +205,20 @@ def test_verify_command_reports_the_readback_minus_the_pv(
     worst = re.search(r"Largest disagreement: (\S+)", result.output)
     assert worst is not None
     assert float(worst.group(1)) == pytest.approx(0.011)
-    assert list(tmp_path.glob("Verify_*.txt"))
-    assert list(tmp_path.glob("Verify_*.png"))
+    assert list(tmp_path.glob("CharacteriseFeedback_*.txt"))
+    assert list(tmp_path.glob("CharacteriseFeedback_*.png"))
 
 
-def test_verify_command_needs_a_compare_pv():
-    result = CliRunner().invoke(app, ["verify", "SIM-MO-TEST-01:Y", "0", "2"])
+def test_characterise_feedback_command_needs_a_compare_pv():
+    result = CliRunner().invoke(
+        app, ["characterise-feedback", "SIM-MO-TEST-01:Y", "0", "2"]
+    )
     assert result.exit_code != 0
     assert "--compare-pv" in result.output
 
 
-def test_verify_help_documents_the_options():
-    help_text = run("verify", "--help")
+def test_characterise_feedback_help_documents_the_options():
+    help_text = run("characterise-feedback", "--help")
     for option in (
         "--compare-pv",
         "--step",
@@ -237,7 +248,7 @@ def _no_sleep(seconds: float) -> None:
     """Skip the default settling delay."""
 
 
-def test_verify_command_defaults_to_twenty_steps_over_the_range(
+def test_characterise_feedback_command_defaults_to_twenty_steps_over_the_range(
     fake_ca: FakeCatools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     monkeypatch.chdir(tmp_path)
@@ -245,43 +256,56 @@ def test_verify_command_defaults_to_twenty_steps_over_the_range(
     fake_ca.signals["SIM-MO-POT-01:POS"] = lambda position: position
     result = CliRunner().invoke(
         app,
-        ["verify", "SIM-MO-TEST-01:Y", "0", "10"]
+        ["characterise-feedback", "SIM-MO-TEST-01:Y", "0", "10"]
         + ["--compare-pv", "SIM-MO-POT-01:POS", "--no-plot", "--no-png"],
     )
 
     assert result.exit_code == 0, result.output
-    lines = next(tmp_path.glob("Verify_*_0.0_10.0_0.5.txt")).read_text().splitlines()
+    lines = (
+        next(tmp_path.glob("CharacteriseFeedback_*_0.0_10.0_0.5.txt"))
+        .read_text()
+        .splitlines()
+    )
     assert len(lines) == 1 + 20
     assert "Repeatability" not in result.output
 
 
-def test_verify_command_repeats_report_the_pot_backlash(
+def test_characterise_feedback_command_repeats_report_the_pot_backlash(
     fake_ca: FakeCatools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     monkeypatch.chdir(tmp_path)
     fake_ca.signals["SIM-MO-POT-01:POS"] = Backlash(0.004)
     result = CliRunner().invoke(
         app,
-        ["verify", "SIM-MO-TEST-01:Y", "0", "2", "--step", "0.5", "--delay", "0"]
+        [
+            "characterise-feedback",
+            "SIM-MO-TEST-01:Y",
+            "0",
+            "2",
+            "--step",
+            "0.5",
+            "--delay",
+            "0",
+        ]
         + ["--repeats", "3", "--compare-pv", "SIM-MO-POT-01:POS", "--no-plot"],
     )
 
     assert result.exit_code == 0, result.output
     assert "Repeatability of Actual Position - SIM-MO-POT-01:POS (mm)" in result.output
-    # Verifying is about the pot, so the stage against its demand is left out
+    # Characterisation measures the feedback, not the stage against demand.
     assert "Demand Position" not in result.output
     assert "Position error" not in result.output
     # The pot lags by 0.004 on the way up, and reads true on the way down
     reversals = re.findall(r"Reversal B \(mean \+ minus mean -\): (\S+)", result.output)
     assert [float(value) for value in reversals] == pytest.approx([0.004])
-    assert list(tmp_path.glob("Verify_*_x3.txt"))
-    assert list(tmp_path.glob("Verify_*_x3.png"))
+    assert list(tmp_path.glob("CharacteriseFeedback_*_x3.txt"))
+    assert list(tmp_path.glob("CharacteriseFeedback_*_x3.png"))
 
 
-def test_verify_command_rejects_a_single_repeat():
+def test_characterise_feedback_command_rejects_a_single_repeat():
     result = CliRunner().invoke(
         app,
-        ["verify", "SIM-MO-TEST-01:Y", "0", "2", "--repeats", "1"]
+        ["characterise-feedback", "SIM-MO-TEST-01:Y", "0", "2", "--repeats", "1"]
         + ["--compare-pv", "SIM-MO-POT-01:POS"],
     )
     assert result.exit_code != 0
@@ -307,3 +331,73 @@ def test_motor_info_reports_a_motor_it_cannot_read(
     assert result.exit_code == 1
     assert "Could not read SIM-MO-TEST-01:Y" in result.stderr
     assert result.stdout == ""
+
+
+@pytest.mark.parametrize("write_txt", [True, False])
+def test_scan_automatically_calibrates_extra_pv(
+    fake_ca: FakeCatools,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_txt: bool,
+):
+    monkeypatch.chdir(tmp_path)
+    pot = "SIM:POT:RAW"
+    fake_ca.signals[pot] = lambda position: 100 + 200 * position
+    args = [
+        "scan",
+        "SIM:Y",
+        "0",
+        "10",
+        "1",
+        "0",
+        "--extra-pv",
+        pot,
+        "--no-plot",
+        "--no-png",
+    ]
+    if not write_txt:
+        args.append("--no-txt")
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0, result.output
+    assert "Fitted Actual against SIM:POT:RAW over 10 readings" in result.output
+    assert 'INPA="SIM:POT:RAW"' in result.output
+    assert 'EGU="mm"' in result.output
+    assert "POWER(A1,5)" in result.output
+    reports = list(tmp_path.glob("Calibration_*.txt"))
+    assert len(reports) == int(write_txt)
+    if reports:
+        assert "EPICS calc record:" in reports[0].read_text()
+
+
+def test_short_scan_keeps_data_when_calibration_is_unavailable(
+    fake_ca: FakeCatools,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    fake_ca.signals["SIM:RAW"] = lambda position: position
+    result = CliRunner().invoke(
+        app,
+        [
+            "scan",
+            "SIM:Y",
+            "0",
+            "2",
+            "1",
+            "0",
+            "--extra-pv",
+            "SIM:RAW",
+            "--no-plot",
+            "--no-png",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Calibration skipped:" in result.output
+    assert "at least 6 distinct" in result.output
+    assert len(list(tmp_path.glob("Scan_*.txt"))) == 1
+    assert not list(tmp_path.glob("Calibration_*.txt"))
+
+
+def test_old_verify_command_is_a_hidden_compatibility_alias():
+    assert "verify" not in run("--help")
+    assert "--compare-pv" in run("verify", "--help")

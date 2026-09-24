@@ -7,6 +7,7 @@ plain CSV works too. The fit is emitted both as an EPICS calc record for
 Builder and as an Excel formula.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,7 @@ from .scanning import (
     COLUMN_DIRECTION,
     COLUMN_MOVE_TIME,
     COLUMN_TIMESTAMP,
+    ScanPoint,
 )
 
 __all__ = [
@@ -170,6 +172,11 @@ def fit_readings(readings: Readings) -> Calibration:
     import numpy as np
     from numpy.polynomial import Polynomial
 
+    if not np.all(np.isfinite(readings.raw)) or not np.all(
+        np.isfinite(readings.position)
+    ):
+        raise ValueError("Calibration needs finite raw and position readings")
+
     distinct = len(np.unique(readings.raw))
     if distinct <= DEGREE:
         raise ValueError(
@@ -185,6 +192,44 @@ def fit_readings(readings: Readings) -> Calibration:
     coefficients[: len(fit.coef)] = fit.coef
     b, c, d, e, f, g = (float(coefficient) for coefficient in coefficients)
     return Calibration(b=b, c=c, d=d, e=e, f=f, g=g)
+
+
+def scan_readings(points: Sequence[ScanPoint], raw_pv: str) -> Readings:
+    """Use the measured readback, rather than demand, to calibrate an extra PV."""
+    import numpy as np
+
+    if any(point.extra is None for point in points):
+        raise ValueError("Calibration needs an extra PV reading at every point")
+    return Readings(
+        raw_column=raw_pv,
+        position_column=COLUMN_ACTUAL,
+        raw=np.asarray([point.extra for point in points], dtype=float),
+        position=np.asarray([point.actual for point in points], dtype=float),
+    )
+
+
+def calibration_report(readings: Readings, egu: str) -> str:
+    """Fit readings and render the coefficients and formulas without writing PVs."""
+    calibration = fit_readings(readings)
+    lines = [
+        f"Fitted {readings.position_column} against {readings.raw_column} "
+        f"over {len(readings.raw)} readings, "
+        f"max residual {max_residual(calibration, readings):.3e} {egu}",
+        "",
+    ]
+    lines.extend(
+        f"{name} = {coefficient:.10e}"
+        for name, coefficient in zip("BCDEFG", calibration.ascending, strict=True)
+    )
+    lines += [
+        "",
+        "EPICS calc record:",
+        calc_record(calibration, readings.raw_column, egu),
+        "",
+        "Excel formula:",
+        excel_formula(calibration, "A1"),
+    ]
+    return "\n".join(lines)
 
 
 def max_residual(calibration: Calibration, readings: Readings) -> float:

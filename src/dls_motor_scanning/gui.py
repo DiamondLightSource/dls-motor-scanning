@@ -1,11 +1,9 @@
-"""A Qt window for verifying a calibration, the ``verify`` command with a face.
+"""A Qt window for scanning, automatic calibration and feedback characterisation.
 
-The form takes the same settings as ``verify``. As they are edited, the plan
-tab previews the motor's position against time, and the number of moves and
-the time the scan will take are worked out from the motor's VELO and ACCL plus
-a fixed overhead per move. While it
-runs, the results, summary and data tabs fill in, and any earlier verify file
-can be opened into them.
+Scan and Characterise feedback each have settings, a motion preview and results.
+Scans with an extra PV automatically fit raw feedback against motor readback
+in the Scan tab's Calibration page. Existing scan files and CSVs can also be
+fitted there. Calibration generates formulas; it never writes them to an IOC.
 
 The window never touches Channel Access itself. Reading the motor and running
 the scan are both done by the command line, in a separate process, whose
@@ -21,7 +19,7 @@ import json
 import sys
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import isclose
 from pathlib import Path
 from types import TracebackType
@@ -35,7 +33,9 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from matplotlib.backends.backend_qt import NavigationToolbar2QT
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
+from matplotlib.text import Text
 
+from .appearance import Appearance
 from .planning import (
     MotionProfile,
     Plan,
@@ -47,12 +47,13 @@ from .scanning import (
     ScanConfig,
     ScanOutput,
     ScanPoint,
-    build_verify_figure,
+    build_figure,
     format_summary,
     headings,
     plan_scan,
     read_scan_file,
     row,
+    scan_filename,
     summarise_scan,
 )
 
@@ -66,6 +67,9 @@ STOP_TIMEOUT_MS = 5_000
 
 ERROR_LINES = 20
 """How many of the scan's last error lines to keep, to show if it fails."""
+
+AUTOMATIC = "(automatic)"
+"""The column choice that lets calibrate pick the column itself."""
 
 
 @dataclass(frozen=True)
@@ -106,6 +110,15 @@ def _spin(
     return box
 
 
+def _fixed_font_text() -> QtWidgets.QPlainTextEdit:
+    text = QtWidgets.QPlainTextEdit()
+    text.setReadOnly(True)
+    text.setFont(
+        QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont)
+    )
+    return text
+
+
 class Canvas(FigureCanvasQTAgg):
     """A matplotlib figure embedded in the window, with a zoom/pan toolbar."""
 
@@ -113,6 +126,33 @@ class Canvas(FigureCanvasQTAgg):
 
     def __init__(self) -> None:
         super().__init__(Figure(layout="tight"))  # pyright: ignore[reportUnknownMemberType]
+        app = QtWidgets.QApplication.instance()
+        if isinstance(app, QtWidgets.QApplication):
+            app.paletteChanged.connect(self.draw_idle)
+
+    def draw(self) -> None:
+        """Follow the current desktop palette, including after a theme change."""
+        palette = QtWidgets.QApplication.palette()
+        background = palette.color(QtGui.QPalette.ColorRole.Window).name()
+        base = palette.color(QtGui.QPalette.ColorRole.Base).name()
+        foreground = palette.color(QtGui.QPalette.ColorRole.WindowText).name()
+        self.figure.set_facecolor(background)
+        for axes in self.figure.axes:
+            axes.set_facecolor(base)
+            axes.tick_params(colors=foreground)  # pyright: ignore[reportUnknownMemberType]
+            for spine in axes.spines.values():
+                spine.set_edgecolor(foreground)
+            for line in axes.lines:
+                if line.get_color() == "black" or line.get_gid() == "palette-text":
+                    line.set_gid("palette-text")
+                    line.set_color(foreground)
+            legend = axes.get_legend()
+            if legend is not None:
+                legend.get_frame().set_facecolor(background)
+                legend.get_frame().set_edgecolor(foreground)
+        for text in self.figure.findobj(Text):
+            text.set_color(foreground)
+        super().draw()
 
     def with_toolbar(self) -> QtWidgets.QWidget:
         """This canvas under a toolbar, ready to put in a tab."""
@@ -123,12 +163,20 @@ class Canvas(FigureCanvasQTAgg):
         return widget
 
 
-class VerifyWindow(QtWidgets.QMainWindow):
-    """The main window: settings and plan on the left, tabs of output on the right."""
+class ScanPanel(QtWidgets.QWidget):
+    """Scan or characterise feedback, with settings on the left and output tabs
+    on the right.
 
-    def __init__(self) -> None:
+    With ``characterise-feedback`` it compares a PV with the readback, and
+    can repeat the scan there and back; otherwise it runs ``scan``, with an
+    optional extra PV and trigger PV.
+    """
+
+    def __init__(self, window: "MainWindow", characterise_feedback: bool) -> None:
         super().__init__()
-        self.setWindowTitle("dls-motor-scanning verify")
+        self.window_ = window
+        self.characterise_feedback = characterise_feedback
+        self.command = "characterise-feedback" if characterise_feedback else "scan"
         self.motor_state: MotorState | None = None
         self.plan: Plan | None = None
         self.running = False
@@ -156,21 +204,20 @@ class VerifyWindow(QtWidgets.QMainWindow):
         splitter = QtWidgets.QSplitter()
         splitter.addWidget(self.form_panel)
         splitter.addWidget(self.tabs)
+        splitter.setChildrenCollapsible(False)
+        splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        self.setCentralWidget(splitter)
-        self._status("Enter a motor and press Read motor")
-        self.resize(1400, 900)
-        self._update_plan()
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(splitter)
+        self.update_plan()
 
     def show_error(self, message: str) -> None:
         """Report an unexpected error without a modal dialog."""
-        self._status(message)
         self.summary_text.appendPlainText(f"\nERROR: {message}")
 
     def _status(self, message: str) -> None:
-        bar = self.statusBar()
-        if bar is not None:
-            bar.showMessage(message)
+        self.window_.status(message)
 
     # ------------------------------------------------------------------ layout
 
@@ -182,8 +229,16 @@ class VerifyWindow(QtWidgets.QMainWindow):
         self.motor_edit.returnPressed.connect(self._read_motor)
         self.motor_label = QtWidgets.QLabel("Not read")
         self.motor_label.setWordWrap(True)
-        self.compare_edit = QtWidgets.QLineEdit()
-        self.compare_edit.setPlaceholderText("calibrated PV, e.g. ...:POT")
+        self.extra_edit = QtWidgets.QLineEdit()
+        self.motor_edit.setMinimumWidth(
+            self.motor_edit.fontMetrics().horizontalAdvance("TS04I-AL-APTR-03:Y") + 24
+        )
+        if self.characterise_feedback:
+            self.extra_edit.setPlaceholderText("calibrated PV, e.g. ...:POT")
+        else:
+            self.extra_edit.setPlaceholderText("optional raw PV to calibrate")
+        self.trigger_edit = QtWidgets.QLineEdit()
+        self.trigger_edit.setPlaceholderText("optional, pulsed after each reading")
 
         motor_row = QtWidgets.QHBoxLayout()
         motor_row.addWidget(self.motor_edit)
@@ -192,7 +247,11 @@ class VerifyWindow(QtWidgets.QMainWindow):
         motor_form = QtWidgets.QFormLayout(motor_box)
         motor_form.addRow("Motor PV", motor_row)
         motor_form.addRow("", self.motor_label)
-        motor_form.addRow("Compare PV", self.compare_edit)
+        motor_form.addRow(
+            "Feedback PV" if self.characterise_feedback else "Extra PV", self.extra_edit
+        )
+        if not self.characterise_feedback:
+            motor_form.addRow("Trigger PV", self.trigger_edit)
 
         self.start_spin = _spin(-1.0, -1e6, 1e6, 4)
         self.stop_spin = _spin(1.0, -1e6, 1e6, 4)
@@ -203,13 +262,21 @@ class VerifyWindow(QtWidgets.QMainWindow):
         self.repeats_spin.setSpecialValueText("1 (single pass)")
         self.repeats_spin.setKeyboardTracking(False)
         self.delay_spin = _spin(0.5, 0.0, 600.0, 2, " s")
+        self.trigger_width_spin = _spin(1.0, 0.0, 600.0, 2, " s")
+        self.trigger_post_spin = _spin(0.0, 0.0, 600.0, 2, " s")
+        self.timestamp_check = QtWidgets.QCheckBox("Add a UTC timestamp column")
         scan_box = QtWidgets.QGroupBox("Scan")
         scan_form = QtWidgets.QFormLayout(scan_box)
         scan_form.addRow("Start", self.start_spin)
         scan_form.addRow("Stop", self.stop_spin)
         scan_form.addRow("Step", self.step_spin)
-        scan_form.addRow("Repeats (there and back)", self.repeats_spin)
+        if self.characterise_feedback:
+            scan_form.addRow("Repeats (there and back)", self.repeats_spin)
         scan_form.addRow("Settling delay", self.delay_spin)
+        if not self.characterise_feedback:
+            scan_form.addRow("Trigger width", self.trigger_width_spin)
+            scan_form.addRow("After trigger", self.trigger_post_spin)
+        scan_form.addRow(self.timestamp_check)
 
         self.velocity_spin = _spin(1.0, 0.0, 1e6, 4, " EGU/s")
         self.accl_spin = _spin(0.5, 0.0, 600.0, 3, " s")
@@ -226,9 +293,11 @@ class VerifyWindow(QtWidgets.QMainWindow):
 
         self.moves_label = QtWidgets.QLabel()
         self.duration_label = QtWidgets.QLabel()
+        self.moves_label.setWordWrap(True)
+        self.duration_label.setWordWrap(True)
         self.warning_label = QtWidgets.QLabel()
         self.warning_label.setWordWrap(True)
-        self.warning_label.setStyleSheet("color: #c0392b")
+
         bold = QtGui.QFont()
         bold.setBold(True)
         self.moves_label.setFont(bold)
@@ -246,43 +315,65 @@ class VerifyWindow(QtWidgets.QMainWindow):
         folder_row = QtWidgets.QHBoxLayout()
         folder_row.addWidget(self.folder_edit)
         folder_row.addWidget(browse)
-        output_box = QtWidgets.QGroupBox("Output folder")
+        output_box = QtWidgets.QGroupBox("Default save folder")
         output_box.setLayout(folder_row)
 
         self.run_button = QtWidgets.QPushButton("Run")
         self.run_button.clicked.connect(self._run)
         self.stop_button = QtWidgets.QPushButton("Stop")
         self.stop_button.setEnabled(False)
-        self.stop_button.clicked.connect(self._request_stop)
+        self.stop_button.clicked.connect(self.request_stop)
         self.open_button = QtWidgets.QPushButton("Open data file...")
         self.open_button.clicked.connect(self._open_file)
+        self.save_button = QtWidgets.QPushButton("Save data...")
+        self.save_button.setEnabled(False)
+        self.save_button.clicked.connect(self._save_data)
         self.progress = QtWidgets.QProgressBar()
         self.progress.setFormat("%v / %m readings")
         self.progress_label = QtWidgets.QLabel()
+        self.progress_label.setWordWrap(True)
         buttons = QtWidgets.QHBoxLayout()
         buttons.addWidget(self.run_button)
         buttons.addWidget(self.stop_button)
 
-        self.form_panel = QtWidgets.QWidget()
-        panel = QtWidgets.QVBoxLayout(self.form_panel)
+        form_content = QtWidgets.QWidget()
+        panel = QtWidgets.QVBoxLayout(form_content)
         for box in (motor_box, scan_box, timing_box, plan_box, output_box):
             panel.addWidget(box)
         panel.addLayout(buttons)
         panel.addWidget(self.progress)
         panel.addWidget(self.progress_label)
         panel.addWidget(self.open_button)
+        panel.addWidget(self.save_button)
         panel.addStretch()
-        self.form_panel.setMaximumWidth(460)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidget(form_content)
+        scroll.setWidgetResizable(True)
+        # QScrollArea otherwise advertises a small default size to the splitter.
+        width = form_content.sizeHint().width()
+        style = self.style()
+        if style is not None:
+            width += style.pixelMetric(QtWidgets.QStyle.PixelMetric.PM_ScrollBarExtent)
+        width += 2 * scroll.frameWidth()
+        scroll.setMinimumWidth(width)
+        scroll.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Minimum, QtWidgets.QSizePolicy.Policy.Expanding
+        )
+        self.form_panel = scroll
 
         self.editable: list[QtWidgets.QWidget] = [
             self.motor_edit,
             self.read_button,
-            self.compare_edit,
+            self.extra_edit,
+            self.trigger_edit,
             self.start_spin,
             self.stop_spin,
             self.step_spin,
             self.repeats_spin,
             self.delay_spin,
+            self.trigger_width_spin,
+            self.trigger_post_spin,
+            self.timestamp_check,
             self.velocity_spin,
             self.accl_spin,
             self.overhead_spin,
@@ -295,22 +386,22 @@ class VerifyWindow(QtWidgets.QMainWindow):
             self.stop_spin,
             self.step_spin,
             self.delay_spin,
+            self.trigger_width_spin,
+            self.trigger_post_spin,
             self.velocity_spin,
             self.accl_spin,
             self.overhead_spin,
         ):
-            spin.valueChanged.connect(self._update_plan)
-        self.repeats_spin.valueChanged.connect(self._update_plan)
-        self.compare_edit.textChanged.connect(self._update_plan)
+            spin.valueChanged.connect(self.update_plan)
+        self.repeats_spin.valueChanged.connect(self.update_plan)
+        self.extra_edit.textChanged.connect(self.update_plan)
+        self.trigger_edit.textChanged.connect(self.update_plan)
+        self.motor_edit.textChanged.connect(self.update_plan)
 
     def _build_tabs(self) -> None:
         self.plan_canvas = Canvas()
         self.results_canvas = Canvas()
-        self.summary_text = QtWidgets.QPlainTextEdit()
-        self.summary_text.setReadOnly(True)
-        self.summary_text.setFont(
-            QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont)
-        )
+        self.summary_text = _fixed_font_text()
         self.table = QtWidgets.QTableWidget()
         self.table.setEditTriggers(
             QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
@@ -321,22 +412,53 @@ class VerifyWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self.results_canvas.with_toolbar(), "Results")
         self.tabs.addTab(self.summary_text, "Summary")
         self.tabs.addTab(self.table, "Data")
+        self.calibration_panel: CalibratePanel | None = None
+        if not self.characterise_feedback:
+            self.calibration_panel = CalibratePanel(self.window_)
+            self.tabs.addTab(self.calibration_panel, "Calibration")
 
     # ------------------------------------------------------------ the settings
 
     def _config(self) -> ScanConfig:
-        """The scan the form describes, as the verify command would run it."""
-        repeats = self.repeats_spin.value()
+        """The scan the form describes, as the command would run it."""
+        extra_pv = self.extra_edit.text().strip()
+        timestamp = self.timestamp_check.isChecked()
+        if self.characterise_feedback:
+            repeats = self.repeats_spin.value()
+            return ScanConfig(
+                motor=self.motor_edit.text().strip(),
+                start=self.start_spin.value(),
+                stop=self.stop_spin.value(),
+                step=self.step_spin.value(),
+                delay=self.delay_spin.value(),
+                extra_pv=extra_pv or "COMPARE-PV",
+                compare=True,
+                repeats=None if repeats == 1 else repeats,
+                timestamp=timestamp,
+                show_plot=False,
+            )
         return ScanConfig(
             motor=self.motor_edit.text().strip(),
             start=self.start_spin.value(),
             stop=self.stop_spin.value(),
             step=self.step_spin.value(),
             delay=self.delay_spin.value(),
-            extra_pv=self.compare_edit.text().strip() or "COMPARE-PV",
-            compare=True,
-            repeats=None if repeats == 1 else repeats,
+            extra_pv=extra_pv or None,
+            trigger_pv=self.trigger_edit.text().strip() or None,
+            trigger_width=self.trigger_width_spin.value(),
+            trigger_post_delay=self.trigger_post_spin.value(),
+            timestamp=timestamp,
             show_plot=False,
+        )
+
+    def _timeline_config(self, config: ScanConfig) -> ScanConfig:
+        """``config`` with the trigger's time folded into the settling delay,
+        which is how long each reading holds the motor still."""
+        if not config.trigger_pv:
+            return config
+        return replace(
+            config,
+            delay=config.delay + config.trigger_width + config.trigger_post_delay,
         )
 
     def _profile(self) -> MotionProfile:
@@ -349,12 +471,14 @@ class VerifyWindow(QtWidgets.QMainWindow):
     def _egu(self) -> str:
         return self.motor_state.egu if self.motor_state else "EGU"
 
-    def _update_plan(self) -> None:
+    def update_plan(self) -> None:
         """Re-plan from the form, and redraw the preview and the estimates."""
         config = self._config()
         position = self.motor_state.position if self.motor_state else None
         try:
-            self.plan = plan_scan_timeline(config, self._profile(), position)
+            self.plan = plan_scan_timeline(
+                self._timeline_config(config), self._profile(), position
+            )
         except ValueError as error:
             self.plan = None
             self.moves_label.setText("-")
@@ -390,15 +514,20 @@ class VerifyWindow(QtWidgets.QMainWindow):
                 f"The range is outside the soft limits "
                 f"{state.low_limit:g} to {state.high_limit:g}."
             )
-        if not self.compare_edit.text().strip():
+        needs_extra = self.characterise_feedback and not self.extra_edit.text().strip()
+        if needs_extra:
             warnings.append("Enter the PV to compare with the readback.")
         if not config.motor:
             warnings.append("Enter the motor PV.")
+        other = self.window_.running_panel()
+        if other is not None and other is not self:
+            warnings.append(f"A {other.command} scan is running in another tab.")
         self.warning_label.setText("\n".join(warnings))
         self.run_button.setEnabled(
             not self.running
+            and other is None
             and bool(config.motor)
-            and bool(self.compare_edit.text().strip())
+            and not needs_extra
             and not (state and state.outside(config.start, config.stop))
         )
         self._draw_plan()
@@ -449,24 +578,13 @@ class VerifyWindow(QtWidgets.QMainWindow):
 
     # ---------------------------------------------------------- motor & timing
 
-    def _command(self, *args: str) -> QtCore.QProcess:
-        """A process that runs this tool's command line with ``args``."""
-        process = QtCore.QProcess(self)
-        environment = QtCore.QProcessEnvironment.systemEnvironment()
-        # Rows are printed as they are read, so don't let them sit in a buffer
-        environment.insert("PYTHONUNBUFFERED", "1")
-        process.setProcessEnvironment(environment)
-        process.setProgram(sys.executable)
-        process.setArguments(["-m", "dls_motor_scanning", *args])
-        return process
-
     def _read_motor(self) -> None:
         motor = self.motor_edit.text().strip()
         if not motor or self.reader is not None:
             return
         self.read_button.setEnabled(False)
         self._status(f"Reading {motor}...")
-        process = self._command("motor-info", motor)
+        process = self.window_.command("motor-info", motor)
         process.finished.connect(self._reader_finished)
         process.errorOccurred.connect(self._reader_failed)
         self.reader = process
@@ -497,7 +615,7 @@ class VerifyWindow(QtWidgets.QMainWindow):
             self.motor_state = None
             self.motor_label.setText(f"Could not read {motor}: {error}")
             self._status(f"Could not read {motor}")
-            self._update_plan()
+            self.update_plan()
             return
 
         self.motor_state = MotorState(
@@ -517,10 +635,10 @@ class VerifyWindow(QtWidgets.QMainWindow):
         )
         self.velocity_spin.setValue(float(state["velocity"]))
         self.accl_spin.setValue(float(state["acceleration_time"]))
-        if not self.compare_edit.text().strip():
-            self.compare_edit.setText(f"{motor}:POT")
+        if self.characterise_feedback and not self.extra_edit.text().strip():
+            self.extra_edit.setText(f"{motor}:POT")
         self._status(f"Read {motor}")
-        self._update_plan()
+        self.update_plan()
 
     # ----------------------------------------------------------------- running
 
@@ -529,25 +647,26 @@ class VerifyWindow(QtWidgets.QMainWindow):
 
     def _choose_folder(self) -> None:
         name = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Output folder", str(self._folder())
+            self, "Default save folder", str(self._folder())
         )
         if name:
             self.folder_edit.setText(name)
 
     def _set_running(self, running: bool) -> None:
         self.running = running
+        self.save_button.setEnabled(not running and bool(self.shown_points))
         for widget in self.editable:
             widget.setEnabled(not running)
         self.stop_button.setEnabled(running)
         self.stop_button.setText("Stop")
-        self._update_plan()
+        self.window_.running_changed()
 
-    def _request_stop(self) -> None:
+    def request_stop(self) -> None:
         """End the scan; the motor still finishes the move it was given.
 
         Ctrl+C would be politer, but cothread doesn't notice SIGINT while it
-        waits on a put. Terminating loses nothing: every row is flushed to the
-        txt file as it is read, and the window has them all anyway.
+        waits on a put. The window retains readings already received for saving
+        after stopping.
         """
         process = self.scanner
         if process is None:
@@ -556,20 +675,51 @@ class VerifyWindow(QtWidgets.QMainWindow):
         self.stop_button.setEnabled(False)
         self.stop_button.setText("Stopping...")
         process.terminate()
-        QtCore.QTimer.singleShot(STOP_TIMEOUT_MS, self._kill_scan)
+        QtCore.QTimer.singleShot(STOP_TIMEOUT_MS, lambda: self._kill_scan(process))
 
-    def _kill_scan(self) -> None:
-        if self.scanner is not None:
-            self.scanner.kill()
+    def _kill_scan(self, process: QtCore.QProcess) -> None:
+        if self.scanner is process:
+            process.kill()
+
+    def _arguments(self, config: ScanConfig) -> list[str]:
+        """The command line that runs ``config``."""
+        if self.characterise_feedback:
+            options = [
+                "--compare-pv",
+                config.extra_pv or "",
+                "--step",
+                str(config.step),
+            ]
+            options += ["--delay", str(config.delay)]
+            if config.repeats is not None:
+                options += ["--repeats", str(config.repeats)]
+            # After --, so that a negative start isn't taken for an option
+            positions = ["--", config.motor, str(config.start), str(config.stop)]
+        else:
+            options: list[str] = []
+            if config.extra_pv:
+                options += ["--extra-pv", config.extra_pv]
+            if config.trigger_pv:
+                options += ["--trigger-pv", config.trigger_pv]
+                options += ["--trigger-width", str(config.trigger_width)]
+                options += ["--trigger-post-delay", str(config.trigger_post_delay)]
+            positions = [
+                "--",
+                config.motor,
+                str(config.start),
+                str(config.stop),
+                str(config.step),
+                str(config.delay),
+            ]
+        options.extend(["--no-plot", "--no-txt", "--no-png"])
+        if config.timestamp:
+            options.append("--timestamp")
+        return [self.command, *options, *positions]
 
     def _run(self) -> None:
-        if self.plan is None or self.running:
+        if self.plan is None or self.running or self.window_.running_panel():
             return
         config = self._config()
-        folder = self._folder()
-        if not folder.is_dir():
-            self.warning_label.setText(f"The output folder {folder} doesn't exist.")
-            return
         answer = QtWidgets.QMessageBox.question(
             self,
             "Run the scan?",
@@ -580,14 +730,7 @@ class VerifyWindow(QtWidgets.QMainWindow):
         if answer != QtWidgets.QMessageBox.StandardButton.Yes:
             return
 
-        options = ["--compare-pv", config.extra_pv or "", "--step", str(config.step)]
-        options += ["--delay", str(config.delay), "--no-plot"]
-        if config.repeats is not None:
-            options += ["--repeats", str(config.repeats)]
-        # After --, so that a negative start isn't taken for an option
-        positions = ["--", config.motor, str(config.start), str(config.stop)]
-        process = self._command("verify", *options, *positions)
-        process.setWorkingDirectory(str(folder))
+        process = self.window_.command(*self._arguments(config))
         process.readyReadStandardOutput.connect(self._scan_output)
         process.readyReadStandardError.connect(self._scan_errors)
         process.finished.connect(self._scan_finished)
@@ -677,6 +820,9 @@ class VerifyWindow(QtWidgets.QMainWindow):
             f"{format_duration(remaining)} left (finishing {finish:%H:%M})"
         )
 
+    def _info(self) -> MotorInfo:
+        return MotorInfo(ueip="?", velo="?", accl="?", egu=self._egu())
+
     def _scan_finished(self, code: int, status: QtCore.QProcess.ExitStatus) -> None:
         del status  # a crash shows as a non-zero code too
         if self.scanner is None:
@@ -694,11 +840,15 @@ class VerifyWindow(QtWidgets.QMainWindow):
             text = "\n".join(self.output.summary)
         elif points and config is not None:
             # Stopped or failed before the command printed its own summary
-            summary = summarise_scan(points, compare=True)
+            summary = summarise_scan(points, compare=self.characterise_feedback)
             _, signed_step = plan_scan(config)
-            info = MotorInfo(ueip="?", velo="?", accl="?", egu=self._egu())
             text = format_summary(
-                config, info, signed_step, len(points), self.shown_started, summary
+                config,
+                self._info(),
+                signed_step,
+                len(points),
+                self.shown_started,
+                summary,
             )
         else:
             text = "No readings were taken."
@@ -716,22 +866,66 @@ class VerifyWindow(QtWidgets.QMainWindow):
         self.progress_label.setText(f"{outcome} after {len(points)} readings")
         self._set_running(False)
         self.tabs.setCurrentIndex(1 if points and code == 0 else 2)
+        # Calibrate only a complete, successful scan.
+        if (
+            not self.characterise_feedback
+            and code == 0
+            and not stopped
+            and config is not None
+            and config.extra_pv
+        ):
+            self._calibrate_scan(config, points)
+
+    def _calibrate_scan(self, config: ScanConfig, points: list[ScanPoint]) -> None:
+        if self.calibration_panel is not None and config.extra_pv:
+            self.calibration_panel.offer_scan(points, config.extra_pv, self._egu())
+            self.tabs.setCurrentWidget(self.calibration_panel)
 
     # -------------------------------------------------------- viewing the data
 
+    def _save_data(self) -> None:
+        """Save the displayed readings only when the user chooses a destination."""
+        config = self.shown_config
+        if self.running or config is None or not self.shown_points:
+            return
+        suggested = self._folder() / f"{scan_filename(config, self.shown_started)}.txt"
+        name, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save scan data", str(suggested), "Scan data (*.txt)"
+        )
+        if not name:
+            return
+        path = Path(name)
+        if not path.suffix:
+            path = path.with_suffix(".txt")
+        lines = [" ".join(headings(config))]
+        lines.extend(
+            " ".join(row(point, config.compare)) for point in self.shown_points
+        )
+        try:
+            path.write_text("\n".join(lines) + "\n")
+        except OSError as error:
+            QtWidgets.QMessageBox.warning(self, "Can't save data", str(error))
+            return
+        self._status(f"Saved {len(self.shown_points)} readings to {path}")
+
     def _open_file(self) -> None:
+        prefix = "CharacteriseFeedback" if self.characterise_feedback else "Scan"
         name, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
-            "Open verify data",
+            f"Open {self.command} data",
             str(self._folder()),
-            "Verify data (Verify_*.txt);;All files (*)",
+            f"{prefix} data ({prefix}_*.txt"
+            + (" Verify_*.txt" if self.characterise_feedback else "")
+            + ");;All files (*)",
         )
         if not name:
             return
         try:
             recorded = read_scan_file(Path(name))
-            if not recorded.config.compare:
-                raise ValueError("it has no comparison column, so isn't from verify")
+            if self.characterise_feedback and not recorded.config.compare:
+                raise ValueError("This file has no feedback comparison column")
+            if not self.characterise_feedback and recorded.config.compare:
+                raise ValueError("Open this file in the Characterise feedback tab")
         except (OSError, ValueError) as error:
             QtWidgets.QMessageBox.warning(self, "Can't open", f"{name}: {error}")
             return
@@ -742,23 +936,29 @@ class VerifyWindow(QtWidgets.QMainWindow):
         for point in recorded.points:
             self._add_table_row(config, point)
         self._draw_results()
-        summary = summarise_scan(recorded.points, compare=True)
+        summary = summarise_scan(recorded.points, compare=self.characterise_feedback)
         _, signed_step = plan_scan(config)
-        info = MotorInfo(ueip="?", velo="?", accl="?", egu=self._egu())
         self.summary_text.setPlainText(
             format_summary(
-                config, info, signed_step, len(recorded.points), started, summary
+                config,
+                self._info(),
+                signed_step,
+                len(recorded.points),
+                started,
+                summary,
             )
         )
         # Fill in the form, so the same scan can be run again
         self.motor_edit.setText(config.motor)
-        self.compare_edit.setText(config.extra_pv or "")
+        self.extra_edit.setText(config.extra_pv or "")
         self.start_spin.setValue(config.start)
         self.stop_spin.setValue(config.stop)
         self.step_spin.setValue(config.step)
         self.repeats_spin.setValue(config.repeats or 1)
+        self.timestamp_check.setChecked(config.timestamp)
         self.tabs.setCurrentIndex(1)
         self._status(f"Opened {Path(name).name}")
+        self._calibrate_scan(config, recorded.points)
 
     def _show(
         self, config: ScanConfig, points: list[ScanPoint], started: datetime.datetime
@@ -766,8 +966,11 @@ class VerifyWindow(QtWidgets.QMainWindow):
         """Point the result tabs at a scan, and clear them."""
         self.shown_config = config
         self.shown_points = points
+        self.save_button.setEnabled(not self.running and bool(points))
         self.shown_started = started
         self.summary_text.clear()
+        if self.calibration_panel is not None:
+            self.calibration_panel.clear_scan()
         columns = headings(config)
         self.table.clear()
         self.table.setRowCount(0)
@@ -787,11 +990,10 @@ class VerifyWindow(QtWidgets.QMainWindow):
         config = self.shown_config
         if config is None or not self.shown_points:
             return
-        info = MotorInfo(ueip="?", velo="?", accl="?", egu=self._egu())
-        summary = summarise_scan(self.shown_points, compare=True)
-        build_verify_figure(
+        summary = summarise_scan(self.shown_points, compare=self.characterise_feedback)
+        build_figure(
             config,
-            info,
+            self._info(),
             self.shown_points,
             self.shown_started,
             summary,
@@ -799,24 +1001,380 @@ class VerifyWindow(QtWidgets.QMainWindow):
         )
         self.results_canvas.draw_idle()
 
+
+class CalibratePanel(QtWidgets.QWidget):
+    """The calibrate command: fit a data file, and show the fit and its output.
+
+    Fitting is plain numpy on a file, so unlike a scan it runs in the window.
+    """
+
+    def __init__(self, window: "MainWindow") -> None:
+        super().__init__()
+        self.window_ = window
+        self.scan_data: Any = None
+
+        self.file_edit = QtWidgets.QLineEdit()
+        self.file_edit.setPlaceholderText("a Scan_*.txt with an extra PV, or a CSV")
+        self.file_edit.editingFinished.connect(self._load_columns)
+        browse = QtWidgets.QPushButton("...")
+        browse.setMaximumWidth(30)
+        browse.clicked.connect(self._choose_file)
+        file_row = QtWidgets.QHBoxLayout()
+        file_row.addWidget(self.file_edit)
+        file_row.addWidget(browse)
+
+        self.raw_combo = QtWidgets.QComboBox()
+        self.position_combo = QtWidgets.QComboBox()
+        for combo in (self.raw_combo, self.position_combo):
+            combo.addItem(AUTOMATIC)
+        self.raw_pv_edit = QtWidgets.QLineEdit()
+        self.raw_pv_edit.setPlaceholderText("defaults to the raw column")
+        self.egu_edit = QtWidgets.QLineEdit("mm")
+        self.cell_edit = QtWidgets.QLineEdit("A1")
+        self.fit_button = QtWidgets.QPushButton("Fit")
+        self.fit_button.clicked.connect(self.fit)
+
+        box = QtWidgets.QGroupBox("Calibrate")
+        form = QtWidgets.QFormLayout(box)
+        form.addRow("Data file", file_row)
+        form.addRow("Raw column", self.raw_combo)
+        form.addRow("Position column", self.position_combo)
+        form.addRow("Raw input PV", self.raw_pv_edit)
+        form.addRow("EGU", self.egu_edit)
+        form.addRow("Excel cell", self.cell_edit)
+        form.addRow(self.fit_button)
+        note = QtWidgets.QLabel(
+            "Fits a 5th order polynomial converting raw feedback into EGUs, "
+            "and prints an EPICS calc record and an Excel formula. A scan with "
+            "an extra PV is calibrated here automatically when it finishes."
+        )
+        note.setWordWrap(True)
+
+        form_panel = QtWidgets.QWidget()
+        panel = QtWidgets.QVBoxLayout(form_panel)
+        panel.addWidget(box)
+        panel.addWidget(note)
+        panel.addStretch()
+        form_panel.setMinimumWidth(form_panel.sizeHint().width())
+
+        self.canvas = Canvas()
+        self.output_text = _fixed_font_text()
+        self.tabs = QtWidgets.QTabWidget()
+        self.tabs.addTab(self.canvas.with_toolbar(), "Fit")
+        self.tabs.addTab(self.output_text, "Output")
+
+        splitter = QtWidgets.QSplitter()
+        splitter.addWidget(form_panel)
+        splitter.addWidget(self.tabs)
+        splitter.setChildrenCollapsible(False)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(splitter)
+
+    def show_error(self, message: str) -> None:
+        """Report an unexpected error without a modal dialog."""
+        self.output_text.appendPlainText(f"\nERROR: {message}")
+
+    def _path(self) -> Path:
+        return Path(self.file_edit.text().strip())
+
+    def _choose_file(self) -> None:
+        start = self.file_edit.text().strip() or str(Path.cwd())
+        name, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Open calibration data",
+            start,
+            "Scan data (Scan_*.txt);;CSV (*.csv);;All files (*)",
+        )
+        if name:
+            self.file_edit.setText(name)
+            self._load_columns()
+            self.fit()
+
+    def clear_scan(self) -> None:
+        self.scan_data = None
+        self.output_text.clear()
+        self.canvas.figure.clear()
+        self.canvas.draw_idle()
+        self.file_edit.clear()
+
+    def offer_scan(self, points: list[ScanPoint], raw_pv: str, egu: str) -> None:
+        from .calibration import scan_readings
+
+        self.scan_data = scan_readings(points, raw_pv)
+        self.file_edit.clear()
+        self.file_edit.setPlaceholderText("Current scan (or choose an existing file)")
+        self.raw_pv_edit.setText(raw_pv)
+        self.egu_edit.setText(egu)
+        for combo in (self.raw_combo, self.position_combo):
+            combo.setCurrentIndex(0)
+        self.fit()
+
+    def offer_file(self, path: Path) -> None:
+        """Load a scan that has just finished, ready to fit."""
+        self.file_edit.setText(str(path))
+        self._load_columns()
+        self.fit()
+
+    def _load_columns(self) -> None:
+        """Offer the file's columns in the column choices."""
+        from .calibration import _read_table  # pyright: ignore[reportPrivateUsage]
+
+        path = self._path()
+        try:
+            columns = [str(column) for column in _read_table(path).columns]
+        except Exception:  # anything pandas can raise on a bad file
+            columns = []
+        for combo in (self.raw_combo, self.position_combo):
+            current = combo.currentText()
+            combo.clear()
+            combo.addItem(AUTOMATIC)
+            combo.addItems(columns)
+            if current in columns:
+                combo.setCurrentText(current)
+
+    def _column(self, combo: QtWidgets.QComboBox) -> str | None:
+        text = combo.currentText()
+        return None if text == AUTOMATIC else text
+
+    def fit(self) -> None:
+        """Fit the file, and show the fit, the residuals and the output."""
+        from .calibration import (
+            calc_record,
+            excel_formula,
+            fit_readings,
+            load_readings,
+            max_residual,
+        )
+
+        path = self._path()
+        if self.scan_data is None and not path.is_file():
+            self.output_text.setPlainText(f"No data file at {path}")
+            self.tabs.setCurrentIndex(1)
+            return
+        egu = self.egu_edit.text().strip() or "mm"
+        try:
+            readings = (
+                load_readings(
+                    path,
+                    self._column(self.raw_combo),
+                    self._column(self.position_combo),
+                )
+                if self.file_edit.text().strip() or self.scan_data is None
+                else self.scan_data
+            )
+            calibration = fit_readings(readings)
+        except (OSError, ValueError) as error:
+            self.output_text.setPlainText(f"Calibration unavailable:\n{error}")
+            self.canvas.figure.clear()
+            self.canvas.draw_idle()
+            self.tabs.setCurrentIndex(1)
+            self.window_.status(f"Can't fit {path.name}")
+            return
+
+        worst = max_residual(calibration, readings)
+        lines = [
+            f"Fitted {readings.position_column} against {readings.raw_column} "
+            f"over {len(readings.raw)} readings, max residual {worst:.3e} {egu}",
+            "",
+        ]
+        for name, coefficient in zip("BCDEFG", calibration.ascending, strict=True):
+            lines.append(f"{name} = {coefficient:.10e}")
+        raw_pv = self.raw_pv_edit.text().strip() or readings.raw_column
+        lines += ["", "EPICS calc record:", calc_record(calibration, raw_pv, egu)]
+        cell = self.cell_edit.text().strip() or "A1"
+        lines += ["", "Excel formula:", excel_formula(calibration, cell)]
+        self.output_text.setPlainText("\n".join(lines))
+        self._draw(readings, calibration, egu)
+        self.tabs.setCurrentIndex(0)
+        self.window_.status(f"Fitted {path.name}, max residual {worst:.3e} {egu}")
+
+    def _draw(self, readings: Any, calibration: Any, egu: str) -> None:
+        import numpy as np
+        from numpy.polynomial import Polynomial
+
+        polynomial = Polynomial(calibration.ascending)
+        raw = np.asarray(readings.raw, dtype=float)
+        position = np.asarray(readings.position, dtype=float)
+        smooth: Any = np.linspace(raw.min(), raw.max(), 500)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+
+        figure = self.canvas.figure
+        figure.clear()
+        fit_axes, residual_axes = figure.subplots(2, 1, sharex=True)
+        fit_axes.plot(raw, position, ".", color="tab:blue", label="readings")
+        fit_axes.plot(smooth, polynomial(smooth), color="tab:orange", label="fit")  # pyright: ignore[reportUnknownArgumentType]
+        fit_axes.set_ylabel(f"{readings.position_column} ({egu})")
+        fit_axes.set_title(f"{readings.position_column} against {readings.raw_column}")
+        fit_axes.legend(loc="best")
+        fit_axes.grid(True, alpha=0.3)
+        residual_axes.plot(raw, position - polynomial(raw), ".", color="tab:red")
+        residual_axes.axhline(0, color="black", linestyle="--", linewidth=1)
+        residual_axes.set_ylabel(f"Reading - fit ({egu})")
+        residual_axes.set_xlabel(readings.raw_column)
+        residual_axes.grid(True, alpha=0.3)
+        self.canvas.draw_idle()
+
+
+class MainWindow(QtWidgets.QMainWindow):
+    """Scan (including calibration) and Characterise feedback, sharing a status bar."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("dls-motor-scanning")
+        # The panels ask about each other while they are built
+        self.scan_panels: list[ScanPanel] = []
+        self.scan_panel = ScanPanel(self, characterise_feedback=False)
+        self.characterise_feedback_panel = ScanPanel(self, characterise_feedback=True)
+        self.scan_panels = [self.scan_panel, self.characterise_feedback_panel]
+
+        self.tabs = QtWidgets.QTabWidget()
+        self.tabs.addTab(self.scan_panel, "Scan")
+        self.tabs.addTab(self.characterise_feedback_panel, "Characterise feedback")
+        self.setCentralWidget(self.tabs)
+        self.status("Enter a motor and press Read motor")
+        self.appearance = Appearance(self)
+        menu_bar = self.menuBar()
+        assert menu_bar is not None
+        appearance_menu = menu_bar.addMenu("Appearance")
+        assert appearance_menu is not None
+        self.appearance_actions = QtWidgets.QActionGroup(self)
+        for mode in ("System", "Light", "Dark"):
+            action = QtWidgets.QAction(mode, self.appearance_actions)
+            action.setCheckable(True)
+            action.setChecked(mode == self.appearance.mode)
+            appearance_menu.addAction(action)  # pyright: ignore[reportUnknownMemberType]
+        self.appearance_actions.triggered.connect(self._appearance_selected)
+
+        # A scroll area's own size hint hides the full height of its form.
+        # Recalculate after layout changes (wrapping, fonts, theme or tab changes).
+        self.fit_timer = QtCore.QTimer(self)
+        self.fit_timer.setSingleShot(True)
+        self.fit_timer.timeout.connect(self.fit_contents)
+        for panel in self.scan_panels:
+            content = panel.form_panel.widget()
+            if content is not None:
+                content.installEventFilter(self)
+        self.tabs.currentChanged.connect(self.schedule_fit)
+        screen = self.screen()
+        available = (
+            screen.availableGeometry().size() if screen else QtCore.QSize(1400, 900)
+        )
+        self.resize(
+            self.sizeHint().expandedTo(QtCore.QSize(1400, 1)).boundedTo(available)
+        )
+
+    def _appearance_selected(self, action: QtWidgets.QAction) -> None:
+        self.appearance.select(action.text())
+        self.schedule_fit()
+
+    def schedule_fit(self) -> None:
+        self.fit_timer.start(0)
+
+    def showEvent(self, a0: QtGui.QShowEvent | None) -> None:  # noqa: N802
+        super().showEvent(a0)
+        self.schedule_fit()
+
+    def eventFilter(  # noqa: N802
+        self, a0: QtCore.QObject | None, a1: QtCore.QEvent | None
+    ) -> bool:
+        if a1 is not None and a1.type() == QtCore.QEvent.Type.LayoutRequest:
+            self.schedule_fit()
+        return super().eventFilter(a0, a1)
+
+    def fit_contents(self) -> None:
+        """Grow to fit the form, but retain scrolling on smaller screens."""
+        if not self.isVisible() or self.isMaximized():
+            return
+        panel = self.scan_panels[self.tabs.currentIndex()]
+        scroll = panel.form_panel
+        content = scroll.widget()
+        viewport = scroll.viewport()
+        if content is None or viewport is None:
+            return
+        layout = content.layout()
+        if layout is None:
+            return
+        layout.activate()
+        height = layout.totalHeightForWidth(viewport.width())
+        if height < 0:
+            height = content.sizeHint().height()
+        chrome = self.height() - scroll.height() + 2 * scroll.frameWidth()
+        desired = QtCore.QSize(self.width(), max(self.height(), height + chrome))
+        screen = self.screen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            frame = self.frameGeometry().size() - self.size()
+            desired = desired.boundedTo(available.size() - frame)
+        self.resize(desired)
+        if screen is not None:
+            available = screen.availableGeometry()
+            frame_rect = self.frameGeometry()
+            self.move(
+                max(
+                    available.left(),
+                    min(frame_rect.left(), available.right() - frame_rect.width() + 1),
+                ),
+                max(
+                    available.top(),
+                    min(frame_rect.top(), available.bottom() - frame_rect.height() + 1),
+                ),
+            )
+
+    def status(self, message: str) -> None:
+        """Show ``message`` in the status bar."""
+        bar = self.statusBar()
+        if bar is not None:
+            bar.showMessage(message)
+
+    def show_error(self, message: str) -> None:
+        """Report an unexpected error in the tab that is showing."""
+        self.status(message)
+        page = self.tabs.currentIndex()
+        if page < len(self.scan_panels):
+            self.scan_panels[page].show_error(message)
+        else:
+            self.scan_panel.show_error(message)
+
+    def command(self, *args: str) -> QtCore.QProcess:
+        """A process that runs this tool's command line with ``args``."""
+        process = QtCore.QProcess(self)
+        environment = QtCore.QProcessEnvironment.systemEnvironment()
+        # Rows are printed as they are read, so don't let them sit in a buffer
+        environment.insert("PYTHONUNBUFFERED", "1")
+        process.setProcessEnvironment(environment)
+        process.setProgram(sys.executable)
+        process.setArguments(["-m", "dls_motor_scanning", *args])
+        return process
+
+    def running_panel(self) -> ScanPanel | None:
+        """The panel whose scan is running, if any: only one runs at a time."""
+        return next((panel for panel in self.scan_panels if panel.running), None)
+
+    def running_changed(self) -> None:
+        """Let every panel re-check whether it may run."""
+        for panel in self.scan_panels:
+            panel.update_plan()
+
     def closeEvent(self, a0: QtGui.QCloseEvent | None) -> None:  # noqa: N802
         """Ask before closing mid-scan, and stop the scan if the answer is yes."""
-        if self.running and a0 is not None:
+        panel = self.running_panel()
+        if panel is not None and a0 is not None:
             answer = QtWidgets.QMessageBox.question(
                 self,
                 "Scan running",
                 "A scan is running. Closing stops it: the motor finishes its "
-                "current move, and the readings so far are kept in the txt "
-                "file. Close anyway?",
+                "current move. Unsaved readings will be lost. Close anyway?",
             )
             if answer != QtWidgets.QMessageBox.StandardButton.Yes:
                 a0.ignore()
                 return
-            self._request_stop()
-            if self.scanner is not None and not self.scanner.waitForFinished(
+            panel.request_stop()
+            if panel.scanner is not None and not panel.scanner.waitForFinished(
                 STOP_TIMEOUT_MS
             ):
-                self.scanner.kill()
+                panel.scanner.kill()
         super().closeEvent(a0)
 
 
@@ -829,7 +1387,7 @@ def _report_uncaught(
         window.show_error(f"{kind.__name__}: {error}")
 
 
-_windows: list[VerifyWindow] = []
+_windows: list[MainWindow] = []
 """The open windows, to report uncaught errors in."""
 
 
@@ -838,7 +1396,7 @@ def main() -> None:
     faulthandler.enable()
     sys.excepthook = _report_uncaught
     app = QtWidgets.QApplication(sys.argv)
-    window = VerifyWindow()
+    window = MainWindow()
     _windows.append(window)
     window.show()
     app.exec_()

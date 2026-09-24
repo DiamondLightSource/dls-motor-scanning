@@ -87,7 +87,7 @@ def scan(
         typer.Option(
             "--extra-pv",
             metavar="PV",
-            help="Additional PV to read at each step and plot against position.",
+            help="Raw feedback PV to read, plot and calibrate against motor readback.",
         ),
     ] = None,
     trigger_pv: Annotated[
@@ -123,7 +123,8 @@ def scan(
 
     The motor is moved from START to STOP in fixed steps. At each step the
     readback position and the time taken for the move are recorded, then
-    summarised as statistics, a txt file and a plot.
+    summarised as statistics, a txt file and a plot. With --extra-pv, also fit
+    a calibration and emit an EPICS calc record and Excel formula.
     """
     from .scanning import ScanConfig
 
@@ -146,12 +147,13 @@ def scan(
     )
 
 
-VERIFY_STEPS = 20
-"""How many steps verify divides the range into when no --step is given."""
+CHARACTERISE_STEPS = 20
+"""Default number of steps for feedback characterisation."""
 
 
+@app.command("verify", hidden=True)
 @app.command()
-def verify(
+def characterise_feedback(
     motor: Motor,
     start: Start,
     stop: Stop,
@@ -168,7 +170,7 @@ def verify(
         typer.Option(
             "--step",
             metavar="EGU",
-            help=f"Step size. Defaults to a {VERIFY_STEPS}th of the range.",
+            help=f"Step size. Defaults to a {CHARACTERISE_STEPS}th of the range.",
         ),
     ] = None,
     delay: Annotated[
@@ -196,9 +198,9 @@ def verify(
     png: Png = True,
     plot: Plot = True,
 ) -> None:
-    """Step scan a motor and compare its readback with another PV.
+    """Characterise feedback accuracy and repeatability against motor readback.
 
-    Use this to verify a calibration against the motor's encoder. Give the
+    Use this to characterise feedback against the motor's encoder. Give the
     full range of the stage as START and STOP: one pass reports the readback
     minus --compare-pv at each step, as statistics, a column in the txt file
     and an extra plot. With --repeats, the range is traversed there and back
@@ -213,7 +215,7 @@ def verify(
             motor=motor,
             start=start,
             stop=stop,
-            step=abs(stop - start) / VERIFY_STEPS if step is None else step,
+            step=abs(stop - start) / CHARACTERISE_STEPS if step is None else step,
             delay=delay,
             extra_pv=compare_pv,
             compare=True,
@@ -335,11 +337,14 @@ def motor_info(motor: Motor) -> None:
 
 @app.command()
 def gui() -> None:
-    """Open a window to plan, run and view verify scans.
+    """Open a window for scanning, calibration and feedback characterisation.
 
-    Set the same options as verify, preview the motor's position against time
+    Scan includes automatic calibration when an extra PV is provided.
+    Characterise feedback has its own tab. Set the same options as
+    the command, preview the motor's position against time
     with the number of moves and an estimate of the time taken, then run it and
-    watch the results fill in. Earlier verify data files can be opened too.
+    watch the results fill in. Earlier data files can be opened too, and a scan
+    with an extra PV is loaded into calibrate when it finishes.
     """
     from .gui import main
 

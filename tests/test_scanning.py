@@ -14,7 +14,7 @@ from dls_motor_scanning.scanning import (
     ScanConfig,
     ScanOutput,
     ScanPoint,
-    build_verify_figure,
+    build_characterise_feedback_figure,
     format_summary,
     headings,
     interactive_backend,
@@ -271,7 +271,7 @@ def test_summarise_scan_compare_keeps_the_sign_of_the_differences():
     assert difference.maximum == pytest.approx(-0.25)
 
 
-def test_perform_scan_compare_writes_a_verify_file_and_plot(
+def test_perform_scan_compare_writes_a_characterise_feedback_file_and_plot(
     fake_ca: FakeCatools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     monkeypatch.chdir(tmp_path)
@@ -279,12 +279,12 @@ def test_perform_scan_compare_writes_a_verify_file_and_plot(
     fake_ca.signals["SIM-MO-POT-01:POS"] = lambda position: position + 0.01
     perform_scan(config(extra_pv="SIM-MO-POT-01:POS", compare=True, save_png=True))
 
-    lines = next(tmp_path.glob("Verify_*.txt")).read_text().splitlines()
+    lines = next(tmp_path.glob("CharacteriseFeedback_*.txt")).read_text().splitlines()
     assert lines[0].split()[-1] == "Actual-Extra"
     # Actual carries the fake motor's 0.001 following error as well
     differences = [float(line.split()[-1]) for line in lines[1:]]
     assert differences == pytest.approx([-0.011] * 4)
-    assert list(tmp_path.glob("Verify_*.png"))
+    assert list(tmp_path.glob("CharacteriseFeedback_*.png"))
     assert not list(tmp_path.glob("Scan_*"))
 
 
@@ -390,7 +390,7 @@ def test_perform_scan_repeats_record_both_directions(
     assert [line.split()[-1] for line in lines[1:9]] == ["+1"] * 4 + ["-1"] * 4
 
 
-def test_read_scan_file_recovers_what_a_verify_scan_wrote(
+def test_read_scan_file_recovers_what_a_characterise_feedback_scan_wrote(
     fake_ca: FakeCatools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     monkeypatch.chdir(tmp_path)
@@ -399,7 +399,7 @@ def test_read_scan_file_recovers_what_a_verify_scan_wrote(
         config(extra_pv="SIM-MO-POT-01:POS", compare=True, repeats=2, timestamp=True)
     )
 
-    recorded = read_scan_file(next(tmp_path.glob("Verify_*_x2.txt")))
+    recorded = read_scan_file(next(tmp_path.glob("CharacteriseFeedback_*_x2.txt")))
 
     assert recorded.points == written
     assert recorded.config.motor == "SIM-MO-TEST-01:Y"
@@ -440,13 +440,13 @@ def test_format_summary_is_what_print_summary_prints(
     print_summary(scan, info, 0.5, 2, started, summary)
 
     assert text == capsys.readouterr().out
-    # Verifying is about the pot, not the stage against its demand
+    # Characterising feedback is about the pot, not the stage against its demand
     assert "Position error" not in text
     assert "Actual Position - SIM-MO-POT-01:POS (mm)" in text
 
 
 @pytest.mark.parametrize("readings", [1, 3, 6, 16])
-def test_verify_figure_draws_a_scan_still_in_progress(readings: int):
+def test_characterise_feedback_figure_draws_a_scan_still_in_progress(readings: int):
     """The GUI redraws as readings arrive, before every group is complete."""
     from matplotlib.figure import Figure
 
@@ -467,10 +467,13 @@ def test_verify_figure_draws_a_scan_still_in_progress(readings: int):
     summary = summarise_scan(points, compare=True)
     started = datetime.datetime(2026, 9, 23)
 
-    assert build_verify_figure(scan, info, points, started, summary, figure) is figure
+    assert (
+        build_characterise_feedback_figure(scan, info, points, started, summary, figure)
+        is figure
+    )
     assert len(figure.axes) == 3
     # Drawing again into the same figure replaces the panels, not adds to them
-    build_verify_figure(scan, info, points, started, summary, figure)
+    build_characterise_feedback_figure(scan, info, points, started, summary, figure)
     assert len(figure.axes) == 3
     figure.savefig(io.BytesIO(), format="png")  # pyright: ignore[reportUnknownMemberType]
 
@@ -529,3 +532,15 @@ def test_read_motor_state_reads_what_the_gui_plans_with(fake_ca: FakeCatools):
         "low_limit",
         "high_limit",
     }
+
+
+def test_legacy_verify_data_still_opens(tmp_path: Path):
+    path = tmp_path / "Verify_SIM:Y_2026-09-24-12:00:00_0.0_2.0_1.0.txt"
+    path.write_text(
+        "Desired Actual MoveTime SIM:POS Actual-Extra\n"
+        "1 0.99 0.1 0.98 0.01\n2 1.99 0.1 1.98 0.01\n"
+    )
+    recorded = read_scan_file(path)
+    assert recorded.config.compare
+    assert recorded.config.extra_pv == "SIM:POS"
+    assert len(recorded.points) == 2

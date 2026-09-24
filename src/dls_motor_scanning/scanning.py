@@ -75,7 +75,7 @@ class ScanConfig:
     trigger_post_delay: float = 0.0
     timestamp: bool = False
     compare: bool = False
-    """Report how far the extra PV is from the readback, to verify a calibration."""
+    """Characterise the extra PV against the motor readback."""
     repeats: int | None = None
     """Bidirectional cycles to run for a repeatability test, or None for one pass."""
     write_txt: bool = True
@@ -274,7 +274,7 @@ def summarise_scan(points: Sequence[ScanPoint], compare: bool = False) -> ScanSu
     summarised too, so their mean is the calibration's offset and their SD its
     scatter. If the scan was repeated in both directions, the repeatability of
     the differences is added when comparing, and otherwise that of the
-    position error: when verifying a calibration, it's the device against the
+    position error: when characterising a calibration, it's the device against the
     readback that matters, not the stage against its demand.
     """
     errors = [point.error for point in points]
@@ -367,7 +367,7 @@ class RecordedScan:
 
 
 FILENAME_PATTERN = re.compile(
-    r"^(?P<prefix>Scan|Verify)_(?P<motor>.+)_"
+    r"^(?P<prefix>Scan|CharacteriseFeedback|Verify)_(?P<motor>.+)_"
     r"(?P<date>\d{4}-\d\d-\d\d-\d\d:\d\d:\d\d)_"
     r"(?P<start>[-+.\deE]+)_(?P<stop>[-+.\deE]+)_(?P<step>[-+.\deE]+?)"
     r"(?:_x(?P<repeats>\d+))?$"
@@ -489,7 +489,7 @@ def read_scan_file(path: Path) -> RecordedScan:
 def scan_filename(config: ScanConfig, started: datetime.datetime) -> str:
     """Build the base name shared by the txt and png outputs."""
     date_text = started.strftime("%Y-%m-%d-%H:%M:%S")
-    prefix = "Verify" if config.compare else "Scan"
+    prefix = "CharacteriseFeedback" if config.compare else "Scan"
     repeats = "" if config.repeats is None else f"_x{config.repeats}"
     return (
         f"{prefix}_{config.motor}_{date_text}_"
@@ -773,22 +773,31 @@ def build_figure(
     points: Sequence[ScanPoint],
     started: datetime.datetime,
     summary: ScanSummary,
+    fig: Any = None,
 ) -> Any:
     """Build the multi-panel figure of position error and move time.
 
-    A verify scan gets :func:`build_verify_figure` instead. Whichever backend
-    the caller has selected is used as-is.
+    Feedback characterisation uses :func:`build_characterise_feedback_figure`.
+    The caller's selected backend is used as-is. It is drawn into ``fig`` if given,
+    which is cleared first, such as a figure embedded in a GUI, or else into a
+    new pyplot figure.
     """
-    import matplotlib.pyplot as plt
-
     if config.compare:
-        return build_verify_figure(config, info, points, started, summary)
+        return build_characterise_feedback_figure(
+            config, info, points, started, summary, fig
+        )
 
+    if fig is None:
+        import matplotlib.pyplot as plt
+
+        fig = plt.figure(figsize=(8.27, 11.69))  # pyright: ignore[reportUnknownMemberType]
+    else:
+        fig.clear()
     errors = [point.error for point in points]
     move_times = [point.move_time for point in points]
 
     n_rows = 2 + bool(config.extra_pv)
-    fig, axes = plt.subplots(n_rows, 1, figsize=(8.27, 11.69))
+    axes = fig.subplots(n_rows, 1)
     # matplotlib annotates suptitle's **kwargs as Unknown, which strict mode flags
     fig.suptitle(  # pyright: ignore[reportUnknownMemberType]
         f"Step Scanning {config.motor}\n"
@@ -858,7 +867,7 @@ DIRECTIONS = ((1, "tab:green", "moving +"), (-1, "tab:purple", "moving -"))
 """Approach direction, the colour it is drawn in, and its legend label."""
 
 
-def build_verify_figure(
+def build_characterise_feedback_figure(
     config: ScanConfig,
     info: MotorInfo,
     points: Sequence[ScanPoint],
@@ -866,7 +875,7 @@ def build_verify_figure(
     summary: ScanSummary,
     fig: Any = None,
 ) -> Any:
-    """Build the figure for a verify scan: the extra PV against the readback.
+    """Plot feedback characterisation: the extra PV against motor readback.
 
     The stage's positioning against its demand is left out, as it says nothing
     about the calibration. A single pass shows the extra PV and the difference
@@ -890,7 +899,7 @@ def build_verify_figure(
     axes = fig.subplots(n_rows, 1)
     # matplotlib annotates suptitle's **kwargs as Unknown, which strict mode flags
     fig.suptitle(  # pyright: ignore[reportUnknownMemberType]
-        f"Verifying {config.extra_pv}\nagainst {config.motor}{PV_RBV}\n"
+        f"Characterising feedback {config.extra_pv}\nagainst {config.motor}{PV_RBV}\n"
         f"Start={config.start} Stop={config.stop} "
         f"Step={abs(config.step)} Delay={config.delay}"
         f"{'' if config.repeats is None else f' Repeats={config.repeats}'}\n"
@@ -1079,6 +1088,22 @@ def perform_scan(config: ScanConfig) -> list[ScanPoint]:
 
     summary = summarise_scan(points, config.compare)
     print_summary(config, info, signed_step, n_points, started, summary)
+
+    if config.extra_pv and not config.compare:
+        from .calibration import calibration_report, scan_readings
+
+        try:
+            report = calibration_report(
+                scan_readings(points, config.extra_pv), info.egu
+            )
+        except ValueError as error:
+            print(f"Calibration skipped: {error}")
+        else:
+            print(f"\nCalibration:\n{report}")
+            if config.write_txt:
+                report_path = Path(f"Calibration_{basename}.txt")
+                report_path.write_text(report + "\n")
+                print(f"  Calibration saved in {report_path}")
 
     # The png is written first, under Agg, so that it survives even if setting
     # up the interactive window afterwards fails or crashes the interpreter.

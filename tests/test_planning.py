@@ -11,7 +11,7 @@ from dls_motor_scanning.planning import (
 from dls_motor_scanning.scanning import ScanConfig
 
 
-def verify(**overrides: object) -> ScanConfig:
+def characterise_feedback(**overrides: object) -> ScanConfig:
     defaults: dict[str, object] = {
         "motor": "SIM-MO-TEST-01:Y",
         "start": 0.0,
@@ -55,7 +55,7 @@ def test_move_duration_rejects_a_motor_that_cannot_move():
 
 
 def test_plan_counts_the_move_to_the_start():
-    plan = plan_scan_timeline(verify(repeats=3), MotionProfile(1.0, 0.0))
+    plan = plan_scan_timeline(characterise_feedback(repeats=3), MotionProfile(1.0, 0.0))
     # 4 steps up and 4 back, 3 times, plus the move to the start
     assert len(plan.targets) == 24
     assert plan.moves == 25
@@ -64,7 +64,7 @@ def test_plan_counts_the_move_to_the_start():
 
 def test_plan_duration_adds_up_the_moves_and_delays():
     profile = MotionProfile(velocity=1.0, acceleration_time=0.0, overhead=1.0)
-    plan = plan_scan_timeline(verify(), profile, position=-1.0)
+    plan = plan_scan_timeline(characterise_feedback(), profile, position=-1.0)
     # 1 mm to the start takes 2 s, then 4 steps of 0.5 s + 1 s + 0.5 s delay
     assert plan.duration == pytest.approx(2.0 + 4 * 2.0)
     assert plan.path[0] == (0.0, -1.0)
@@ -73,7 +73,7 @@ def test_plan_duration_adds_up_the_moves_and_delays():
 
 
 def test_plan_path_is_a_sawtooth():
-    plan = plan_scan_timeline(verify(repeats=2), MotionProfile(1.0, 0.0))
+    plan = plan_scan_timeline(characterise_feedback(repeats=2), MotionProfile(1.0, 0.0))
     positions = [position for _, position in plan.readings]
     assert positions == [0.5, 1.0, 1.5, 2.0, 1.5, 1.0, 0.5, 0.0] * 2
     times = [seconds for seconds, _ in plan.path]
@@ -82,7 +82,7 @@ def test_plan_path_is_a_sawtooth():
 
 def test_plan_rejects_an_impossible_scan():
     with pytest.raises(ValueError):
-        plan_scan_timeline(verify(stop=0.0), MotionProfile(1.0, 0.5))
+        plan_scan_timeline(characterise_feedback(stop=0.0), MotionProfile(1.0, 0.5))
 
 
 @pytest.mark.parametrize(
@@ -95,7 +95,7 @@ def test_format_duration(seconds: float, text: str):
 
 def test_path_until_follows_the_readings_taken():
     profile = MotionProfile(velocity=1.0, acceleration_time=0.0, overhead=1.0)
-    plan = plan_scan_timeline(verify(), profile, position=-1.0)
+    plan = plan_scan_timeline(characterise_feedback(), profile, position=-1.0)
 
     # None yet: still where it started, on the way to the start
     assert plan.path_until(0) == [(0.0, -1.0)]
