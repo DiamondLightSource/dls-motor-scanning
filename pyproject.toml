@@ -27,7 +27,7 @@ readme = "README.md"
 # under 3.12/3.13 it segfaults once it is driving a Qt event loop for the plot.
 # Pinning here is also what makes `uvx dls-motor-scanning` pick a working
 # interpreter without the caller having to pass --python.
-requires-python = ">=3.11,<3.12"
+requires-python = ">=3.14,<3.15"
 
 [dependency-groups]
 dev = [
