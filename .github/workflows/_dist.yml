@@ -19,7 +19,7 @@ jobs:
       # the wheel install below would be rejected. Track .python-version so
       # this stays correct if the pin changes.
       - name: Set up python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version-file: .python-version
 
